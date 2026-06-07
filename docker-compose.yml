@@ -1,0 +1,29 @@
+name: wa-immich-sync
+
+services:
+  wa-immich-sync:
+    build: .
+    image: wa-immich-sync:local
+    restart: unless-stopped
+    # Run as a non-root user so files written to ./data stay user-owned.
+    # Set to your own uid:gid if different (see `id -u` / `id -g`).
+    user: "1000:1000"
+    env_file: .env
+    # Reach an Immich server running on the Docker host. With this, set
+    # IMMICH_URL=http://host.docker.internal:2283 in your .env.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persist WhatsApp auth credentials + sqlite dedup db across restarts.
+      - ./data:/app/data
+
+    # --- If Immich runs in its OWN Docker stack ---
+    # Instead of host.docker.internal, join Immich's network and set
+    # IMMICH_URL=http://<immich-service-name>:2283 in your .env. Uncomment:
+    # networks:
+    #   - default
+    #   - immich
+# networks:
+#   immich:
+#     external: true
+#     name: immich_default   # the external network your Immich stack uses

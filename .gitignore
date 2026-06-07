@@ -1,0 +1,27 @@
+# Dependencies & build
+node_modules/
+dist/
+
+# Local docker overrides (instance-specific; auto-merged by compose)
+docker-compose.override.yml
+
+# Secrets & runtime state (NEVER commit)
+.env
+.env.*
+!.env.example
+# WhatsApp auth credentials + sqlite dedup db
+data/
+*.log
+
+# Local AI/dev tooling state (not part of the project)
+.claude/
+.claude-flow/
+.swarm/
+.ruvector/
+*.rvf
+*.rvf.lock
+ruvector.db
+agentdb.rvf
+.mcp.json
+claude-flow.config*.json*
+CLAUDE.md

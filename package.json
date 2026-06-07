@@ -1,0 +1,46 @@
+{
+  "name": "wa-immich-sync",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Sync photos and videos from whitelisted WhatsApp groups to a self-hosted Immich server",
+  "license": "MIT",
+  "keywords": [
+    "whatsapp",
+    "immich",
+    "baileys",
+    "sync",
+    "self-hosted",
+    "photos"
+  ],
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "pair": "tsx scripts/pair.ts",
+    "list-groups": "tsx scripts/list-groups.ts",
+    "import": "tsx scripts/import-export.ts",
+    "status": "tsx scripts/status.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@whiskeysockets/baileys": "^6.7.0",
+    "adm-zip": "^0.5.17",
+    "better-sqlite3": "^11.3.0",
+    "pino": "^9.5.0",
+    "qrcode-terminal": "^0.12.0",
+    "tsx": "^4.19.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.19.19",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
