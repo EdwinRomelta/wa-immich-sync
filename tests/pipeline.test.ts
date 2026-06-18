@@ -16,7 +16,8 @@ const sock = { updateMediaMessage: vi.fn(), sendMessage: vi.fn(async () => {}) }
 const msg = (jid: string) => ({ key: { remoteJid: jid, id: '1' } }) as never;
 
 function makePipeline(cfg: AppConfig, m: ReturnType<typeof mocks>) {
-  const p = createPipeline({ config: cfg, ...m, logger });
+  // No-op sleep keeps retry-backed paths instant in tests.
+  const p = createPipeline({ config: cfg, ...m, logger, retry: { sleep: async () => {} } });
   p.setGroups(groups);
   return p;
 }
@@ -61,11 +62,12 @@ describe('pipeline', () => {
     expect(await p.process(sock, msg('g@g.us'))).toBe('skipped-no-media');
   });
 
-  it('skips when already deduped', async () => {
+  it('skips when already deduped — before downloading (no extract)', async () => {
     const m = mocks(item());
     m.dedup.has = vi.fn(() => true);
     const p = makePipeline(baseConfig, m);
     expect(await p.process(sock, msg('g@g.us'))).toBe('skipped-dedup');
+    expect(m.extract).not.toHaveBeenCalled();
     expect(m.immich.uploadAsset).not.toHaveBeenCalled();
   });
 
@@ -86,6 +88,20 @@ describe('pipeline', () => {
     const p = makePipeline(baseConfig, m);
     expect(await p.process(sock, msg('g@g.us'))).toBe('error');
     expect(m.dedup.markDone).not.toHaveBeenCalled();
+  });
+
+  it('retries a transient upload failure then marks done', async () => {
+    const m = mocks(item());
+    let calls = 0;
+    m.immich.uploadAsset = vi.fn(async () => {
+      calls += 1;
+      if (calls < 2) throw new Error('Timed Out');
+      return { assetId: 'a1', status: 'created' as const };
+    });
+    const p = makePipeline(baseConfig, m);
+    expect(await p.process(sock, msg('g@g.us'))).toBe('uploaded');
+    expect(m.immich.uploadAsset).toHaveBeenCalledTimes(2);
+    expect(m.dedup.markDone).toHaveBeenCalledWith('g@g.us:1', 'g@g.us', 'a1', 'created');
   });
 
   it('albumMode "none" skips album calls', async () => {

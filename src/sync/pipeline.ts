@@ -3,6 +3,7 @@ import type { AppConfig, GroupConfig } from '../types.ts';
 import { extractMedia, type ExtractDeps } from '../wa/mediaExtractor.ts';
 import type { ImmichClient } from '../immich/client.ts';
 import type { DedupStore } from './dedupStore.ts';
+import { withRetry, type RetryOpts } from '../util/retry.ts';
 
 type PipelineLogger = {
   info: (...a: unknown[]) => void;
@@ -19,6 +20,8 @@ export interface PipelineDeps {
   /** Injectable extractor for tests. */
   extract?: typeof extractMedia;
   extractDeps?: ExtractDeps;
+  /** Override upload retry behaviour (mainly for tests). */
+  retry?: RetryOpts;
 }
 
 export type ProcessOutcome =
@@ -57,6 +60,15 @@ export function createPipeline(deps: PipelineDeps) {
     const group = whitelist.get(jid);
     if (!group) return 'skipped-not-whitelisted';
 
+    // Dedup by message key BEFORE downloading. History/append batches replay
+    // already-synced messages; downloading them first would waste bandwidth and
+    // hammer WhatsApp (worsening the media timeouts).
+    const rawId = m.key?.id ?? '';
+    if (rawId && deps.dedup.has(`${jid}:${rawId}`)) {
+      deps.logger.debug?.({ messageId: `${jid}:${rawId}` }, 'dedup skip (pre-download)');
+      return 'skipped-dedup';
+    }
+
     const item = await extract(sock, m, deps.config, group.name, deps.extractDeps);
     if (!item) return 'skipped-no-media';
 
@@ -66,12 +78,21 @@ export function createPipeline(deps: PipelineDeps) {
     }
 
     try {
-      const uploaded = await deps.immich.uploadAsset(item);
+      // Retry transient Immich failures so a single HTTP hiccup doesn't drop
+      // the image (it would otherwise never be retried for a live message).
+      const uploaded = await withRetry(() => deps.immich.uploadAsset(item), {
+        ...deps.retry,
+        onRetry: (err, attempt) =>
+          deps.logger.warn(
+            { messageId: item.messageId, attempt, err: (err as Error).message },
+            'immich upload retry',
+          ),
+      });
 
       const albumName = albumNameFor(group);
       if (albumName) {
-        const albumId = await deps.immich.ensureAlbum(albumName);
-        await deps.immich.addToAlbum(albumId, uploaded.assetId);
+        const albumId = await withRetry(() => deps.immich.ensureAlbum(albumName), deps.retry);
+        await withRetry(() => deps.immich.addToAlbum(albumId, uploaded.assetId), deps.retry);
       }
 
       deps.dedup.markDone(item.messageId, item.groupJid, uploaded.assetId, uploaded.status);

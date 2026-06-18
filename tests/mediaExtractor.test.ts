@@ -61,4 +61,19 @@ describe('extractMedia', () => {
     const m = { key: { remoteJid: 'g@g.us' }, message: { imageMessage: {} } } as never;
     expect(await extractMedia(sock, m, config, 'Fam', { download: fakeDownload })).toBeNull();
   });
+
+  it('retries a transient download failure instead of dropping the image', async () => {
+    let calls = 0;
+    const flaky = vi.fn(async () => {
+      calls += 1;
+      if (calls < 2) throw new Error('Timed Out');
+      return Buffer.from('img-bytes');
+    }) as never;
+    const item = await extractMedia(sock, imageMsg(), config, 'Fam', {
+      download: flaky,
+      retry: { sleep: async () => {} },
+    });
+    expect(item?.buffer.toString()).toBe('img-bytes');
+    expect(flaky).toHaveBeenCalledTimes(2);
+  });
 });

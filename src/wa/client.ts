@@ -76,7 +76,11 @@ export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return; // only fresh live messages; history handled separately
+    // 'notify' = fresh live messages. 'append' = messages delivered on
+    // (re)connect / buffer flush — offline-queued and recent items that the
+    // timing-out initial history sync never delivers. Process both so a missed
+    // window self-heals; dedup (by key, pre-download) skips already-synced ones.
+    if (type !== 'notify' && type !== 'append') return;
     for (const m of messages) {
       try {
         await opts.onMessage(sock, m);

@@ -53,6 +53,27 @@ export class DedupStore {
       .all() as GroupCount[];
   }
 
+  /**
+   * Newest known message per group (by created_at), used to seed the backfill
+   * cursor when WhatsApp's on-connect history sync is unavailable. Returns the
+   * raw WhatsApp message id (the part after the `jid:` prefix).
+   */
+  newestByGroup(): { group_jid: string; raw_id: string; created_at: number }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT group_jid, message_id, created_at FROM synced s
+         WHERE group_jid LIKE '%@g.us'
+           AND created_at = (SELECT MAX(created_at) FROM synced WHERE group_jid = s.group_jid)
+         GROUP BY group_jid`,
+      )
+      .all() as { group_jid: string; message_id: string; created_at: number }[];
+    return rows.map((r) => ({
+      group_jid: r.group_jid,
+      raw_id: r.message_id.slice(r.group_jid.length + 1),
+      created_at: r.created_at,
+    }));
+  }
+
   lastSyncedAt(): number | null {
     const row = this.db.prepare('SELECT MAX(created_at) AS m FROM synced').get() as { m: number | null };
     return row.m ?? null;

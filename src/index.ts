@@ -138,6 +138,22 @@ async function main(): Promise<void> {
       }
 
       if (!config.backfill) return;
+
+      // Seed the backfill cursor from the dedup DB. WhatsApp's on-connect
+      // history sync times out in some links (no messaging-history.set ever
+      // fires), leaving anchors empty so the pump never pages. Seeding from the
+      // newest known message lets on-demand fetchMessageHistory page backward
+      // and recover gaps without re-pairing.
+      for (const seed of dedup.newestByGroup()) {
+        if (!whitelistJids.has(seed.group_jid)) continue;
+        anchors.note(
+          seed.group_jid,
+          { remoteJid: seed.group_jid, id: seed.raw_id, fromMe: false },
+          Math.floor(seed.created_at / 1000),
+        );
+        logger.info({ jid: seed.group_jid, anchor: seed.raw_id }, 'backfill: seeded from dedup db');
+      }
+
       // Restart the pump on each (re)connect with the live socket; anchors persist.
       backfill?.stop();
       backfill = startBackfill({ sock, groupJids: [...whitelistJids], anchors, logger });

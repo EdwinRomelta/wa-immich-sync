@@ -1,5 +1,6 @@
 import { downloadMediaMessage, type WAMessage, type WASocket } from '@whiskeysockets/baileys';
 import type { AppConfig, MediaItem, MediaKind } from '../types.ts';
+import { withRetry, type RetryOpts } from '../util/retry.ts';
 
 /** Minimal shape of the socket bits the extractor needs (eases testing). */
 type DownloadSock = Pick<WASocket, 'updateMediaMessage'>;
@@ -8,6 +9,8 @@ export interface ExtractDeps {
   /** Injectable downloader for tests. */
   download?: typeof downloadMediaMessage;
   logger?: { error: (...args: unknown[]) => void };
+  /** Override download retry behaviour (mainly for tests). */
+  retry?: RetryOpts;
 }
 
 type AnyMessage = Record<string, any> | null | undefined;
@@ -62,13 +65,26 @@ export async function extractMedia(
   if (!groupJid || !rawId) return null;
 
   // Download from a normalized message so wrapped (ephemeral/view-once) media works.
+  // Retry transient failures (Baileys media timeouts) so a single blip doesn't
+  // permanently drop the image.
   const normalized = { key: m.key, message: content } as WAMessage;
   const download = deps.download ?? downloadMediaMessage;
-  const buffer = (await download(
-    normalized,
-    'buffer',
-    {},
-    { reuploadRequest: sock.updateMediaMessage } as never,
+  const buffer = (await withRetry(
+    () =>
+      download(
+        normalized,
+        'buffer',
+        {},
+        { reuploadRequest: sock.updateMediaMessage } as never,
+      ) as Promise<Buffer>,
+    {
+      ...deps.retry,
+      onRetry: (err, attempt) =>
+        deps.logger?.error(
+          { messageId: `${groupJid}:${rawId}`, attempt, err: (err as Error).message },
+          'media download retry',
+        ),
+    },
   )) as Buffer;
 
   const tsRaw = m.messageTimestamp;

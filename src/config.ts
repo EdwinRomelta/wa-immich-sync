@@ -4,6 +4,12 @@ import type { AppConfig } from './types.ts';
 let dotenvLoaded = false;
 function ensureDotenv(): void {
   if (dotenvLoaded) return;
+  // Under Vitest, never read the on-disk .env — tests set process.env
+  // explicitly and a real .env would clobber that and break isolation.
+  if (process.env.VITEST) {
+    dotenvLoaded = true;
+    return;
+  }
   try {
     process.loadEnvFile();
   } catch {
