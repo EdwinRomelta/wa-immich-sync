@@ -32,6 +32,17 @@ export class ImmichClient {
     return { 'x-api-key': this.apiKey, accept: 'application/json', ...extra };
   }
 
+  /**
+   * Liveness probe. Throws while Immich is unreachable or still booting, so
+   * callers can hold work (e.g. the WhatsApp connect) until uploads can land.
+   */
+  async ping(): Promise<void> {
+    const res = await this.fetch(`${this.baseUrl}/api/server/ping`, { headers: this.headers() });
+    if (!res.ok) {
+      throw new Error(`Immich ping failed (${res.status}): ${await safeText(res)}`);
+    }
+  }
+
   /** Upload one asset. Immich dedupes by checksum and may return status 'duplicate'. */
   async uploadAsset(item: MediaItem): Promise<UploadResult> {
     const form = new FormData();

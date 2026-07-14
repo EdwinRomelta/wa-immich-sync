@@ -3,6 +3,8 @@ export interface RetryOpts {
   retries?: number;
   /** Base backoff in ms; doubles each retry (exponential). Default 1000. */
   baseDelayMs?: number;
+  /** Upper bound for a single backoff sleep; uncapped when omitted. */
+  maxDelayMs?: number;
   /** Called before each retry sleep, with the error and the upcoming attempt number. */
   onRetry?: (err: unknown, attempt: number) => void;
   /** Injectable sleep (eases testing). */
@@ -30,7 +32,8 @@ export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOpts = {}): 
       lastErr = err;
       if (attempt === retries) break;
       opts.onRetry?.(err, attempt + 1);
-      await sleep(baseDelayMs * 2 ** attempt);
+      const delay = baseDelayMs * 2 ** attempt;
+      await sleep(opts.maxDelayMs !== undefined ? Math.min(delay, opts.maxDelayMs) : delay);
     }
   }
   throw lastErr;

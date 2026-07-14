@@ -76,4 +76,26 @@ describe('ImmichClient', () => {
     expect(opts.method).toBe('PUT');
     expect(JSON.parse(opts.body as string)).toEqual({ ids: ['asset-1'] });
   });
+
+  it('ping GETs /api/server/ping and resolves on ok', async () => {
+    const fetchImpl = vi.fn(async () => jsonRes({ res: 'pong' }));
+    const c = new ImmichClient({ baseUrl: 'http://immich', apiKey: 'k', fetchImpl: fetchImpl as never });
+    await expect(c.ping()).resolves.toBeUndefined();
+    const [url] = fetchImpl.mock.calls[0] as unknown as [string];
+    expect(url).toBe('http://immich/api/server/ping');
+  });
+
+  it('ping throws when the server is unreachable', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError('fetch failed: connect ECONNREFUSED');
+    });
+    const c = new ImmichClient({ baseUrl: 'http://immich', apiKey: 'k', fetchImpl: fetchImpl as never });
+    await expect(c.ping()).rejects.toThrow(/ECONNREFUSED/);
+  });
+
+  it('ping throws on a non-ok response', async () => {
+    const fetchImpl = vi.fn(async () => jsonRes({ error: 'boot' }, false, 503));
+    const c = new ImmichClient({ baseUrl: 'http://immich', apiKey: 'k', fetchImpl: fetchImpl as never });
+    await expect(c.ping()).rejects.toThrow(/503/);
+  });
 });

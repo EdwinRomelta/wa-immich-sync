@@ -44,4 +44,18 @@ describe('withRetry', () => {
     await expect(withRetry(fn, { retries: 3, baseDelayMs: 100, sleep })).rejects.toThrow();
     expect(delays).toEqual([100, 200, 400]);
   });
+
+  it('caps the backoff at maxDelayMs so long waits stay bounded', async () => {
+    const delays: number[] = [];
+    const sleep = async (ms: number) => {
+      delays.push(ms);
+    };
+    const fn = vi.fn(async () => {
+      throw new Error('nope');
+    });
+    await expect(
+      withRetry(fn, { retries: 5, baseDelayMs: 100, maxDelayMs: 300, sleep }),
+    ).rejects.toThrow();
+    expect(delays).toEqual([100, 200, 300, 300, 300]);
+  });
 });

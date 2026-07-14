@@ -8,6 +8,7 @@ import { OldestAnchors, startBackfill } from './sync/backfill.ts';
 import { handleBackfillMessage } from './sync/backfillIngest.ts';
 import { resolveWhitelist } from './wa/groupResolver.ts';
 import { startWaClient } from './wa/client.ts';
+import { withRetry } from './util/retry.ts';
 
 /** WhatsApp message timestamp (seconds), tolerant of number | Long | undefined. */
 function tsSecOf(m: WAMessage): number {
@@ -30,6 +31,21 @@ async function main(): Promise<void> {
   );
 
   const immich = new ImmichClient({ baseUrl: immichUrl, apiKey: immichApiKey });
+
+  // At host boot this container and Immich start in the same second, and
+  // WhatsApp's offline replay (`append`) fires within seconds of connecting —
+  // long before Immich finishes booting. Uploads then die on ECONNREFUSED and
+  // that replay window is gone for good (2026-07-08 photos were lost this way).
+  // Hold the WhatsApp connect until Immich actually answers.
+  await withRetry(() => immich.ping(), {
+    retries: 120,
+    baseDelayMs: 1000,
+    maxDelayMs: 10_000,
+    onRetry: (err, attempt) =>
+      logger.warn({ attempt, err: (err as Error).message }, 'waiting for Immich to come up'),
+  });
+  logger.info('Immich reachable');
+
   const dedup = new DedupStore(getDedupDb());
   const pipeline = createPipeline({ config, immich, dedup, logger, extractDeps: { logger } });
 
