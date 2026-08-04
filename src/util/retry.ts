@@ -1,3 +1,5 @@
+import { backoffDelayMs } from './backoff.ts';
+
 export interface RetryOpts {
   /** Extra attempts after the first one. Default 3 (so up to 4 tries total). */
   retries?: number;
@@ -32,8 +34,7 @@ export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOpts = {}): 
       lastErr = err;
       if (attempt === retries) break;
       opts.onRetry?.(err, attempt + 1);
-      const delay = baseDelayMs * 2 ** attempt;
-      await sleep(opts.maxDelayMs !== undefined ? Math.min(delay, opts.maxDelayMs) : delay);
+      await sleep(backoffDelayMs(attempt, { baseMs: baseDelayMs, maxMs: opts.maxDelayMs }));
     }
   }
   throw lastErr;

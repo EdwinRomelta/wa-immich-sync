@@ -13,4 +13,10 @@ RUN npm install --omit=dev
 COPY . .
 
 ENV NODE_ENV=production
-CMD ["npx", "tsx", "src/index.ts"]
+
+# Exec the tsx binary directly rather than going through `npx`. As PID 1, npm
+# ran the app as a `sh -c` grandchild, so SIGTERM never reached the process:
+# the SIGINT/SIGTERM handler in src/index.ts never ran, the sqlite db was never
+# closed (leaving an unbounded WAL), and every clean stop reported exit code 1
+# as if it had crashed.
+CMD ["./node_modules/.bin/tsx", "src/index.ts"]

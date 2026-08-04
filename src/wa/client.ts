@@ -8,6 +8,26 @@ import makeWASocket, {
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import type { Logger } from '../logger.ts';
+import { startStallWatchdog } from '../util/stallWatchdog.ts';
+import { backoffDelayMs } from '../util/backoff.ts';
+
+/**
+ * A healthy Baileys link exchanges keepalive frames every ~30s. Total inbound
+ * silence for this long means the socket died without a close event (zombie);
+ * the server keeps pushing messages into it and they are lost forever.
+ */
+const STALL_TIMEOUT_MS = 10 * 60_000;
+const STALL_CHECK_MS = 60_000;
+
+/**
+ * Reconnect backoff. A flat retry interval turns a sustained WhatsApp-side
+ * rejection (e.g. the 405 storm on 2026-07-28) into a tight loop hammering the
+ * account — which this bot number shares with other services. Back off
+ * exponentially with jitter instead, and reset once a link actually opens.
+ */
+const RECONNECT_BASE_MS = 3_000;
+const RECONNECT_MAX_MS = 5 * 60_000;
+const RECONNECT_JITTER = 0.3;
 
 export interface WaClientOptions {
   authDir: string;
@@ -20,6 +40,11 @@ export interface WaClientOptions {
   onHistory?: (sock: WASocket, messages: WAMessage[]) => Promise<void> | void;
   /** Called once the connection opens. */
   onReady?: (sock: WASocket) => void;
+  /**
+   * Consecutive failed connect attempts, used to space out reconnects.
+   * Set internally when re-entering after a disconnect; callers pass nothing.
+   */
+  reconnectAttempt?: number;
 }
 
 /**
@@ -27,6 +52,9 @@ export interface WaClientOptions {
  * linked device. Auth state is persisted under `authDir`.
  */
 export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
+  // Reset by a successful 'open' so a healthy link always reconnects promptly.
+  let reconnectAttempt = opts.reconnectAttempt ?? 0;
+
   const { state, saveCreds } = await useMultiFileAuthState(opts.authDir);
   // Keep Baileys' own logging quiet; our app logger handles the useful events.
   const waLogger = pino({ level: 'warn' });
@@ -45,6 +73,16 @@ export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
 
   sock.ev.on('creds.update', saveCreds);
 
+  const watchdog = startStallWatchdog({
+    timeoutMs: STALL_TIMEOUT_MS,
+    checkEveryMs: STALL_CHECK_MS,
+    onStall: (idleMs) => {
+      opts.logger.warn({ idleMs }, 'stall watchdog: no inbound frames — forcing reconnect');
+      sock.end(new Error('stall watchdog'));
+    },
+  });
+  sock.ws.on('message', () => watchdog.touch());
+
   sock.ev.on('connection.update', (update) => {
     const { connection, qr, lastDisconnect } = update;
 
@@ -54,11 +92,13 @@ export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
     }
 
     if (connection === 'open') {
+      reconnectAttempt = 0;
       opts.logger.info('WhatsApp connection open');
       opts.onReady?.(sock);
     }
 
     if (connection === 'close') {
+      watchdog.stop();
       const statusCode = (lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)
         ?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
@@ -68,10 +108,20 @@ export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
         opts.logger.error('Logged out by WhatsApp. Delete the auth dir and re-run `npm run pair`.');
         return;
       }
-      // Transient disconnect: recreate the socket (listeners re-register).
+      // Transient disconnect: recreate the socket (listeners re-register),
+      // spacing attempts out so a persistent rejection cannot become a storm.
+      const nextAttempt = reconnectAttempt + 1;
+      const delayMs = backoffDelayMs(reconnectAttempt, {
+        baseMs: RECONNECT_BASE_MS,
+        maxMs: RECONNECT_MAX_MS,
+        jitterRatio: RECONNECT_JITTER,
+      });
+      opts.logger.info({ attempt: nextAttempt, delayMs }, 'scheduling WhatsApp reconnect');
       setTimeout(() => {
-        startWaClient(opts).catch((err) => opts.logger.error(err, 'reconnect failed'));
-      }, 3000);
+        startWaClient({ ...opts, reconnectAttempt: nextAttempt }).catch((err) =>
+          opts.logger.error(err, 'reconnect failed'),
+        );
+      }, delayMs);
     }
   });
 

@@ -4,7 +4,14 @@ services:
   wa-immich-sync:
     build: .
     image: wa-immich-sync:local
-    restart: unless-stopped
+    # `always`, not `unless-stopped`: an explicitly stopped container is never
+    # revived by `unless-stopped`, so a one-off stop silently ends the sync
+    # until someone notices (it went unnoticed for 6 days on 2026-07-29).
+    # `always` brings it back with the Docker daemon.
+    restart: always
+    # PID 1 must reap zombies and forward SIGTERM to the app so its shutdown
+    # handler closes the sqlite db cleanly.
+    init: true
     # Run as a non-root user so files written to ./data stay user-owned.
     # Set to your own uid:gid if different (see `id -u` / `id -g`).
     user: "1000:1000"

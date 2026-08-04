@@ -70,7 +70,22 @@ export function createPipeline(deps: PipelineDeps) {
     }
 
     const item = await extract(sock, m, deps.config, group.name, deps.extractDeps);
-    if (!item) return 'skipped-no-media';
+    if (!item) {
+      // Surface WHAT was skipped — silent drops of unsupported media (e.g.
+      // images sent as documents) are otherwise indistinguishable from text.
+      deps.logger.info(
+        {
+          messageId: `${jid}:${rawId}`,
+          group: group.name,
+          contentKeys: Object.keys((m.message ?? {}) as Record<string, unknown>),
+          messageTimestamp: Number(m.messageTimestamp ?? 0),
+          stubType: m.messageStubType ?? null,
+          hasMessage: m.message != null,
+        },
+        'skipped-no-media',
+      );
+      return 'skipped-no-media';
+    }
 
     if (deps.dedup.has(item.messageId)) {
       deps.logger.debug?.({ messageId: item.messageId }, 'dedup skip');

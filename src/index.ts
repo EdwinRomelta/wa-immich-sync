@@ -9,6 +9,7 @@ import { handleBackfillMessage } from './sync/backfillIngest.ts';
 import { resolveWhitelist } from './wa/groupResolver.ts';
 import { startWaClient } from './wa/client.ts';
 import { withRetry } from './util/retry.ts';
+import { createGate } from './util/gate.ts';
 
 /** WhatsApp message timestamp (seconds), tolerant of number | Long | undefined. */
 function tsSecOf(m: WAMessage): number {
@@ -65,11 +66,19 @@ async function main(): Promise<void> {
   let backfillGroupJid: string | null = null;
   let backfillDefaultAlbum = config.singleAlbumName ?? 'WhatsApp Backfill';
 
+  // WhatsApp can deliver the initial history batch ~200ms after connect —
+  // before groupFetchAllParticipating() resolves the whitelist. Processing
+  // against an empty whitelist drops real messages as "not whitelisted"
+  // (photos queued while the host was off land exactly in that batch). Hold
+  // all message processing until the first whitelist resolution completes.
+  const whitelistGate = createGate();
+
   await startWaClient({
     authDir: getWaAuthDir(),
     syncFullHistory: config.backfill,
     logger,
     onMessage: async (sock, m) => {
+      await whitelistGate.wait();
       const jid = m.key?.remoteJid ?? '';
       const hasDocument = JSON.stringify(m.message ?? {}).includes('documentMessage');
 
@@ -109,6 +118,7 @@ async function main(): Promise<void> {
     },
     onHistory: config.backfill
       ? async (sock, messages) => {
+          await whitelistGate.wait();
           const batchTally: Record<string, number> = {};
           for (const m of messages) {
             noteAnchor(m);
@@ -152,6 +162,10 @@ async function main(): Promise<void> {
       } catch (err) {
         logger.warn({ err: (err as Error).message }, 'group resolution failed');
       }
+
+      // Open even if resolution failed — buffered messages then evaluate
+      // against the previous (or empty) whitelist, same as before this gate.
+      whitelistGate.open();
 
       if (!config.backfill) return;
 
