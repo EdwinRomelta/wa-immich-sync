@@ -1,5 +1,4 @@
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { openDb } from './db.ts';
 import Database from 'better-sqlite3';
 
 export interface GroupCount {
@@ -15,10 +14,8 @@ export interface GroupCount {
 export class DedupStore {
   private readonly db: Database.Database;
 
-  constructor(path: string) {
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
-    this.db = new Database(path);
-    this.db.pragma('journal_mode = WAL');
+  constructor(pathOrDb: string | Database.Database) {
+    this.db = typeof pathOrDb === 'string' ? openDb(pathOrDb) : pathOrDb;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS synced (
         message_id      TEXT PRIMARY KEY,

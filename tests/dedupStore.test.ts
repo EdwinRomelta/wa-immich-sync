@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DedupStore } from '../src/sync/dedupStore.ts';
+import { openDb } from '../src/sync/db.ts';
 
 describe('DedupStore', () => {
   it('has() is false before and true after markDone()', () => {
@@ -34,5 +35,15 @@ describe('DedupStore', () => {
     s.markDone('A:1', 'A', 'x', 'created');
     expect(typeof s.lastSyncedAt()).toBe('number');
     s.close();
+  });
+
+  it('accepts a shared Database instance so other stores can share the connection', () => {
+    const db = openDb(':memory:');
+    const store = new DedupStore(db);
+    store.markDone('g@g.us:A1', 'g@g.us', 'asset-1', 'created');
+    expect(store.count()).toBe(1);
+    // The same connection sees the table.
+    const row = db.prepare('SELECT COUNT(*) AS c FROM synced').get() as { c: number };
+    expect(row.c).toBe(1);
   });
 });
