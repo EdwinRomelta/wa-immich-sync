@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ImmichClient } from '../src/immich/client.ts';
+import type { UploadMeta } from '../src/immich/client.ts';
 import type { MediaItem } from '../src/types.ts';
 
 function makeItem(): MediaItem {
@@ -97,5 +98,28 @@ describe('ImmichClient', () => {
     const fetchImpl = vi.fn(async () => jsonRes({ error: 'boot' }, false, 503));
     const c = new ImmichClient({ baseUrl: 'http://immich', apiKey: 'k', fetchImpl: fetchImpl as never });
     await expect(c.ping()).rejects.toThrow(/503/);
+  });
+
+  it('uploads a Blob directly with the same fields as uploadAsset', async () => {
+    let captured: FormData | null = null;
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      captured = init.body as FormData;
+      return new Response(JSON.stringify({ id: 'asset-7', status: 'created' }), { status: 201 });
+    }) as unknown as typeof fetch;
+
+    const client = new ImmichClient({ baseUrl: 'http://immich', apiKey: 'k', fetchImpl });
+    const meta: UploadMeta = {
+      messageId: 'g@g.us:A1',
+      fileName: 'IMG-1.jpg',
+      mimeType: 'image/jpeg',
+      timestamp: new Date('2026-07-28T08:28:06.000Z'),
+    };
+
+    const result = await client.uploadBlob(new Blob([new Uint8Array([1, 2, 3])]), meta);
+
+    expect(result).toEqual({ assetId: 'asset-7', status: 'created' });
+    expect(captured!.get('deviceAssetId')).toBe('g@g.us:A1');
+    expect(captured!.get('filename')).toBe('IMG-1.jpg');
+    expect(captured!.get('fileCreatedAt')).toBe('2026-07-28T08:28:06.000Z');
   });
 });

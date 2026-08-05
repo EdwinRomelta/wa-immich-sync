@@ -13,6 +13,15 @@ interface AlbumSummary {
   albumName: string;
 }
 
+/** Everything Immich needs about an asset besides its bytes. */
+export interface UploadMeta {
+  /** Becomes deviceAssetId — the stable per-message key. */
+  messageId: string;
+  fileName: string;
+  mimeType: string;
+  timestamp: Date;
+}
+
 /** Thin REST client for an Immich server (API-key auth via `x-api-key`). */
 export class ImmichClient {
   private readonly baseUrl: string;
@@ -45,13 +54,22 @@ export class ImmichClient {
 
   /** Upload one asset. Immich dedupes by checksum and may return status 'duplicate'. */
   async uploadAsset(item: MediaItem): Promise<UploadResult> {
+    const blob = new Blob([new Uint8Array(item.buffer)], { type: item.mimeType });
+    return this.uploadBlob(blob, item);
+  }
+
+  /**
+   * Upload from a Blob. Drain passes a file-backed Blob (`fs.openAsBlob`) so a
+   * large video streams instead of being read entirely into memory.
+   */
+  async uploadBlob(blob: Blob, meta: UploadMeta): Promise<UploadResult> {
     const form = new FormData();
-    form.append('assetData', new Blob([new Uint8Array(item.buffer)], { type: item.mimeType }), item.fileName);
-    form.append('deviceAssetId', item.messageId);
+    form.append('assetData', blob, meta.fileName);
+    form.append('deviceAssetId', meta.messageId);
     form.append('deviceId', this.deviceId);
-    form.append('fileCreatedAt', item.timestamp.toISOString());
-    form.append('fileModifiedAt', item.timestamp.toISOString());
-    form.append('filename', item.fileName);
+    form.append('fileCreatedAt', meta.timestamp.toISOString());
+    form.append('fileModifiedAt', meta.timestamp.toISOString());
+    form.append('filename', meta.fileName);
 
     const res = await this.fetch(`${this.baseUrl}/api/assets`, {
       method: 'POST',
