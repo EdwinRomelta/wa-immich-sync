@@ -126,6 +126,23 @@ describe('OutboxStore', () => {
     expect(row.nextTryAt).toBe(9_999);
   });
 
+  it('drops a row without recording it as synced', () => {
+    const { db, outbox, dedup } = setup();
+    outbox.enqueue(make());
+
+    outbox.remove('g@g.us:A1');
+
+    expect(outbox.has('g@g.us:A1')).toBe(false);
+    expect(outbox.depth()).toBe(0);
+    expect(dedup.has('g@g.us:A1')).toBe(false);
+    expect(db.prepare('SELECT 1 FROM synced WHERE message_id = ?').get('g@g.us:A1')).toBeUndefined();
+  });
+
+  it('tolerates removing a message that is not queued', () => {
+    const { outbox } = setup();
+    expect(() => outbox.remove('g@g.us:nope')).not.toThrow();
+  });
+
   it('lists staged file paths so orphans can be swept', () => {
     const { outbox } = setup();
     outbox.enqueue(make({ messageId: 'g@g.us:A1', filePath: '/tmp/outbox/one' }));

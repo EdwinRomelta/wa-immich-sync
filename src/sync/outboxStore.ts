@@ -135,6 +135,16 @@ export class OutboxStore {
       .run(error, nextTryAt, messageId);
   }
 
+  /**
+   * Drop a row without recording it as synced. For terminal failures where
+   * retrying can never succeed (e.g. the staged file is gone) — unlike
+   * `defer`, this makes the message eligible for re-ingest again, since
+   * `ingest.known()` treats any existing outbox row as already handled.
+   */
+  remove(messageId: string): void {
+    this.db.prepare('DELETE FROM outbox WHERE message_id = ?').run(messageId);
+  }
+
   depth(): number {
     return (this.db.prepare('SELECT COUNT(*) AS c FROM outbox').get() as { c: number }).c;
   }
