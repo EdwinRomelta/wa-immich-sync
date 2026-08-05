@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -87,9 +87,15 @@ describe('ingest', () => {
   });
 
   it('skips when the message carries no media', async () => {
-    const { ing, sock, extract } = setup();
+    const { ing, sock, extract, logger } = setup();
     extract.mockResolvedValueOnce(null as never);
     expect(await ing.ingest(sock as never, msg())).toBe('skipped-no-media');
+    // The diagnostic is the point: an unsupported type (an image sent as a
+    // document) is otherwise indistinguishable from a plain text message.
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'g@g.us:A1', contentKeys: ['imageMessage'] }),
+      'skipped-no-media',
+    );
   });
 
   it('writes the bytes to disk and queues a row', async () => {
@@ -98,10 +104,48 @@ describe('ingest', () => {
 
     const rows = outbox.due(Date.now(), 10);
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.messageId).toBe('g@g.us:A1');
-    expect(rows[0]!.albumName).toBe('Daycare');
-    expect(rows[0]!.capturedAt).toBe(new Date('2026-07-28T08:28:06.000Z').getTime());
+    // Assert the whole row: fileName and mimeType are adjacent same-typed
+    // arguments, so a swap must not pass.
+    expect(rows[0]).toEqual({
+      messageId: 'g@g.us:A1',
+      groupJid: 'g@g.us',
+      albumName: 'Daycare',
+      filePath: rows[0]!.filePath,
+      fileName: 'IMG-A1.jpg',
+      mimeType: 'image/jpeg',
+      capturedAt: new Date('2026-07-28T08:28:06.000Z').getTime(),
+      createdAt: rows[0]!.createdAt,
+      attempts: 0,
+      lastError: null,
+      nextTryAt: 0,
+    });
     expect(readFileSync(rows[0]!.filePath).toString()).toBe('photo-bytes');
+  });
+
+  it('defaults the single album name to "WhatsApp"', async () => {
+    const { ing, outbox, sock } = setup({ albumMode: 'single' });
+    await ing.ingest(sock as never, msg());
+    expect(outbox.due(Date.now(), 10)[0]!.albumName).toBe('WhatsApp');
+  });
+
+  it('deletes the staged file when the row insert fails', async () => {
+    const { ing, dir, sock, logger } = setup();
+    // Nothing will ever reference bytes whose row never landed.
+    vi.spyOn(OutboxStore.prototype, 'enqueue').mockImplementationOnce(() => {
+      throw new Error('boom');
+    });
+
+    expect(await ing.ingest(sock as never, msg())).toBe('error');
+    expect(readdirSync(dir).filter((f) => f !== 'tmp')).toEqual([]);
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('lets a failure from the media download propagate to the caller', async () => {
+    const { ing, sock, extract } = setup();
+    // index.ts catches per message; ingest must not convert this into a
+    // successful-looking outcome.
+    extract.mockRejectedValueOnce(new Error('download timed out') as never);
+    await expect(ing.ingest(sock as never, msg())).rejects.toThrow('download timed out');
   });
 
   it('records an empty album name when albumMode is "none"', async () => {

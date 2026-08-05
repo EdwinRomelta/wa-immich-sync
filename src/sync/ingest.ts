@@ -1,3 +1,4 @@
+import { rm } from 'node:fs/promises';
 import type { WAMessage, WASocket } from '@whiskeysockets/baileys';
 import type { AppConfig, GroupConfig } from '../types.ts';
 import { extractMedia, type ExtractDeps } from '../wa/mediaExtractor.ts';
@@ -93,6 +94,8 @@ export function createIngest(deps: IngestDeps) {
       return 'skipped-no-media';
     }
 
+    // Re-check after the download: a concurrent upsert ('notify' then 'append'
+    // carrying the same message) may have queued it while we awaited the bytes.
     if (known(item.messageId)) {
       deps.logger.debug?.({ messageId: item.messageId }, 'dedup skip');
       return 'skipped-dedup';
@@ -102,19 +105,31 @@ export function createIngest(deps: IngestDeps) {
       // Bytes to disk FIRST, row second. A crash between the two leaves an
       // orphan file (swept at startup), never a row without its media.
       const filePath = await stageFile(deps.outboxDir, item.messageId, item.buffer);
-      deps.outbox.enqueue({
-        messageId: item.messageId,
-        groupJid: item.groupJid,
-        albumName: albumNameFor(group),
-        filePath,
-        fileName: item.fileName,
-        mimeType: item.mimeType,
-        capturedAt: item.timestamp.getTime(),
-        createdAt: Date.now(),
-      });
+      try {
+        deps.outbox.enqueue({
+          messageId: item.messageId,
+          groupJid: item.groupJid,
+          albumName: albumNameFor(group),
+          filePath,
+          fileName: item.fileName,
+          mimeType: item.mimeType,
+          capturedAt: item.timestamp.getTime(),
+          createdAt: Date.now(),
+        });
+      } catch (err) {
+        // The row never landed, so nothing will ever reference these bytes.
+        // Drop them now rather than leaving an orphan for the startup sweep —
+        // this daemon is meant to run unattended for weeks.
+        await rm(filePath, { force: true }).catch(() => {});
+        throw err;
+      }
       deps.logger.info({ messageId: item.messageId, group: group.name, kind: item.kind }, 'queued');
     } catch (err) {
-      deps.logger.error({ err: (err as Error).message }, `ingest failed for ${item.messageId}`);
+      // Pass the whole error so pino's serializer keeps the type and stack.
+      deps.logger.error(
+        { err, code: (err as NodeJS.ErrnoException).code },
+        `ingest failed for ${item.messageId}`,
+      );
       return 'error';
     }
 
