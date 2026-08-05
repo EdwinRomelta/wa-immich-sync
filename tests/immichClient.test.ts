@@ -122,4 +122,44 @@ describe('ImmichClient', () => {
     expect(captured!.get('filename')).toBe('IMG-1.jpg');
     expect(captured!.get('fileCreatedAt')).toBe('2026-07-28T08:28:06.000Z');
   });
+
+  it('sends an identical request whether the source is a buffer or a blob', async () => {
+    const forms: FormData[] = [];
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      forms.push(init.body as FormData);
+      return jsonRes({ id: 'asset-1', status: 'created' });
+    });
+    const c = new ImmichClient({
+      baseUrl: 'http://immich',
+      apiKey: 'k',
+      fetchImpl: fetchImpl as never,
+    });
+
+    const item = makeItem();
+    await c.uploadAsset(item);
+    // An untyped blob, exactly as fs.openAsBlob() produces one.
+    await c.uploadBlob(new Blob([new Uint8Array(item.buffer)]), item);
+
+    // Compare whole forms, not a handful of fields: this is the property the
+    // refactor exists to preserve, including the part's name, filename and type.
+    const snap = async (f: FormData) =>
+      Promise.all(
+        [...f.entries()].map(async ([k, v]) =>
+          v instanceof Blob ? [k, v.type, v.size, await v.text()] : [k, v],
+        ),
+      );
+    expect(await snap(forms[1]!)).toEqual(await snap(forms[0]!));
+  });
+
+  it('rejects a 200 that carries no asset id instead of returning undefined', async () => {
+    const fetchImpl = vi.fn(async () => jsonRes({ status: 'created' }));
+    const c = new ImmichClient({
+      baseUrl: 'http://immich',
+      apiKey: 'k',
+      fetchImpl: fetchImpl as never,
+    });
+    // Drain deletes the staged file once this resolves, so an id-less success
+    // must throw rather than record an undefined asset id.
+    await expect(c.uploadAsset(makeItem())).rejects.toThrow(/no asset id/);
+  });
 });

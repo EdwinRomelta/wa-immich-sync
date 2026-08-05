@@ -63,8 +63,14 @@ export class ImmichClient {
    * large video streams instead of being read entirely into memory.
    */
   async uploadBlob(blob: Blob, meta: UploadMeta): Promise<UploadResult> {
+    // fs.openAsBlob() does not infer a type from the extension, so a file-backed
+    // blob arrives untyped and would be sent as application/octet-stream. Re-type
+    // it here rather than trusting every caller to remember; slice() keeps the
+    // blob file-backed, so this does not read the media into memory.
+    const body = blob.type === meta.mimeType ? blob : blob.slice(0, blob.size, meta.mimeType);
+
     const form = new FormData();
-    form.append('assetData', blob, meta.fileName);
+    form.append('assetData', body, meta.fileName);
     form.append('deviceAssetId', meta.messageId);
     form.append('deviceId', this.deviceId);
     form.append('fileCreatedAt', meta.timestamp.toISOString());
@@ -79,7 +85,12 @@ export class ImmichClient {
     if (!res.ok) {
       throw new Error(`Immich upload failed (${res.status}): ${await safeText(res)}`);
     }
-    const data = (await res.json()) as { id: string; status?: string };
+    const data = (await res.json()) as { id?: string; status?: string };
+    // Validate before the caller acts on it. Drain deletes the staged file once
+    // this resolves, so an id-less 200 would lose the media irrecoverably.
+    if (typeof data?.id !== 'string' || data.id === '') {
+      throw new Error(`Immich upload returned no asset id: ${JSON.stringify(data).slice(0, 200)}`);
+    }
     return { assetId: data.id, status: (data.status as UploadResult['status']) ?? 'created' };
   }
 
