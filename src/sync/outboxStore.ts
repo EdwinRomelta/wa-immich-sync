@@ -78,10 +78,14 @@ export class OutboxStore {
   enqueue(item: NewOutboxItem): void {
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO outbox
+        // ON CONFLICT rather than OR IGNORE: re-enqueuing a known message is a
+        // no-op, but a NOT NULL violation must still throw. OR IGNORE would
+        // swallow it and silently drop media already staged on disk.
+        `INSERT INTO outbox
            (message_id, group_jid, album_name, file_path, file_name, mime_type,
             captured_at, attempts, last_error, created_at, next_try_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, 0)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, 0)
+         ON CONFLICT(message_id) DO NOTHING`,
       )
       .run(
         item.messageId,
@@ -100,9 +104,12 @@ export class OutboxStore {
   }
 
   due(now: number, limit: number): OutboxRow[] {
+    // SQLite reads a negative LIMIT as unbounded; clamp so a misconfigured
+    // batch size cannot pull the entire queue into memory.
+    const batch = Math.max(0, Math.trunc(limit));
     const rows = this.db
       .prepare('SELECT * FROM outbox WHERE next_try_at <= ? ORDER BY created_at ASC LIMIT ?')
-      .all(now, limit) as RawRow[];
+      .all(now, batch) as RawRow[];
     return rows.map(toRow);
   }
 
