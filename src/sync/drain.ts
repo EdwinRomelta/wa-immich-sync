@@ -119,8 +119,16 @@ async function stageFileStatus(filePath: string): Promise<StageStatus> {
  * `ingest.known()` treats any existing outbox row as already handled, so the
  * message could never be captured again even if it resurfaces via history
  * sync or a zip backfill. That row is dropped instead: loudly logged, removed
- * from the outbox, and left out of `synced` so the message stays eligible for
- * re-ingest. Two guards keep a directory-level outage from being mistaken for
+ * from the outbox, and left out of `synced`.
+ *
+ * Be clear about what dropping buys. It unblocks re-ingest in principle, but
+ * nothing re-delivers the message on its own: live upserts only carry new
+ * traffic, and `startBackfill` pages backwards from the oldest anchor, away
+ * from a dropped message rather than toward it. In practice the media is lost
+ * unless an operator notices the ERROR line and re-imports a chat export. That
+ * is still strictly better than deferring, which loses the media AND wedges
+ * the row AND re-warns every tick forever. Two guards keep a directory-level
+ * outage from being mistaken for
  * a batch of dead rows: a row is only dropped once it has earned it
  * (`dropAfterAttempts`), and a single tick can only drop so many
  * (`maxDropsPerTick`) before it stops and leaves the rest for next time.
