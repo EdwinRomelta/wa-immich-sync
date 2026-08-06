@@ -1,5 +1,5 @@
 import { statSync } from 'node:fs';
-import { getDedupDb, getOutboxDir, loadConfig } from '../src/config.ts';
+import { getDedupDb, getOutboxDir, loadConfig, outboxGuards } from '../src/config.ts';
 import { logger } from '../src/logger.ts';
 import { openDb } from '../src/sync/db.ts';
 import { DedupStore } from '../src/sync/dedupStore.ts';
@@ -43,7 +43,12 @@ async function main(): Promise<void> {
 
   const albumName = pickAlbumName();
   const outboxDir = getOutboxDir();
-  await ensureOutboxDirWritable(outboxDir);
+  // Same overlap guard the daemon enforces at startup (src/index.ts) — reused
+  // from config.ts so this script and the daemon cannot drift apart. Without
+  // it, an OUTBOX_DIR misconfigured to overlap DEDUP_DB or WA_AUTH_DIR (e.g.
+  // OUTBOX_DIR=./data) would plant the outbox marker and stage media right
+  // next to synced.db/auth/ here, then have the daemon refuse to boot on it.
+  await ensureOutboxDirWritable(outboxDir, outboxGuards());
   const db = openDb(getDedupDb());
   // DedupStore before OutboxStore: OutboxStore's constructor assumes the
   // `synced` table (created by DedupStore) already exists on this connection.
@@ -51,9 +56,14 @@ async function main(): Promise<void> {
   const outbox = new OutboxStore(db);
 
   logger.info({ folder, album: albumName || '(none)' }, 'import starting');
-  const stats = await importFolder(folder, { outbox, dedup, outboxDir, albumName, logger });
-  dedup.close();
-  logger.info(stats, 'import queued; run the daemon to upload to Immich');
+  try {
+    const stats = await importFolder(folder, { outbox, dedup, outboxDir, albumName, logger });
+    logger.info(stats, 'import queued; run the daemon to upload to Immich');
+  } finally {
+    // Must run even if importFolder throws, or a failed run leaks the sqlite
+    // handle (and its WAL lock) instead of closing cleanly.
+    dedup.close();
+  }
 }
 
 main().catch((err) => {

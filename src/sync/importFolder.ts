@@ -5,27 +5,32 @@ import { extname, join, relative } from 'node:path';
 import type { DedupStore } from './dedupStore.ts';
 import type { OutboxStore } from './outboxStore.ts';
 import { stageFile } from './staging.ts';
-import type { MediaKind } from '../types.ts';
 
-export const MEDIA_MIME: Record<string, { kind: MediaKind; mime: string }> = {
-  '.jpg': { kind: 'image', mime: 'image/jpeg' },
-  '.jpeg': { kind: 'image', mime: 'image/jpeg' },
-  '.png': { kind: 'image', mime: 'image/png' },
-  '.webp': { kind: 'image', mime: 'image/webp' },
-  '.gif': { kind: 'image', mime: 'image/gif' },
-  '.heic': { kind: 'image', mime: 'image/heic' },
-  '.mp4': { kind: 'video', mime: 'video/mp4' },
-  '.3gp': { kind: 'video', mime: 'video/3gpp' },
-  '.mov': { kind: 'video', mime: 'video/quicktime' },
-  '.mkv': { kind: 'video', mime: 'video/x-matroska' },
-  '.webm': { kind: 'video', mime: 'video/webm' },
-  '.avi': { kind: 'video', mime: 'video/x-msvideo' },
+// `kind` was dropped from here: it only ever fed MediaItem.kind, and nothing
+// in the outbox-based import path (this file) constructs a MediaItem —
+// importFolder only ever reads `.mime` below.
+export const MEDIA_MIME: Record<string, { mime: string }> = {
+  '.jpg': { mime: 'image/jpeg' },
+  '.jpeg': { mime: 'image/jpeg' },
+  '.png': { mime: 'image/png' },
+  '.webp': { mime: 'image/webp' },
+  '.gif': { mime: 'image/gif' },
+  '.heic': { mime: 'image/heic' },
+  '.mp4': { mime: 'video/mp4' },
+  '.3gp': { mime: 'video/3gpp' },
+  '.mov': { mime: 'video/quicktime' },
+  '.mkv': { mime: 'video/x-matroska' },
+  '.webm': { mime: 'video/webm' },
+  '.avi': { mime: 'video/x-msvideo' },
 };
 
 export interface ImportStats {
   scanned: number;
   queued: number;
-  skippedDedup: number;
+  /** Already in Immich (dedup.has) — genuinely synced, safe to call "done". */
+  skippedSynced: number;
+  /** Already staged in the outbox (outbox.has) — queued but not yet uploaded. */
+  skippedQueued: number;
   skippedType: number;
   errors: number;
 }
@@ -69,9 +74,13 @@ export function dateForFile(path: string): Date {
  * Invalid Date. `OutboxStore.enqueue` writes `captured_at` as `NOT NULL`;
  * `Invalid Date.getTime()` is `NaN`, better-sqlite3 binds `NaN` as `NULL`,
  * and the insert throws `NOT NULL constraint failed: outbox.captured_at`.
- * The live ingest path takes its timestamp from WhatsApp (already guarded);
- * this path parses it out of export filenames — a much weaker source — so
- * fall back to a known-valid timestamp rather than letting the insert fail.
+ *
+ * `dateForFile`'s two regexes only ever feed digit-bounded values into
+ * `new Date(...)` (which does not throw or return Invalid Date for
+ * out-of-range components — it wraps), and its own fallback is
+ * `statSync(path).mtime`, which is valid for any file that exists. So today
+ * this guard is unreachable — it is a regression backstop for future edits
+ * to `dateForFile`, not a live defence, and must not be described as one.
  */
 export function safeCapturedAtMs(date: Date, fallbackMs: number): number {
   return Number.isNaN(date.getTime()) ? fallbackMs : date.getTime();
@@ -88,7 +97,8 @@ export async function importFolder(folder: string, deps: ImportDeps): Promise<Im
   const stats: ImportStats = {
     scanned: 0,
     queued: 0,
-    skippedDedup: 0,
+    skippedSynced: 0,
+    skippedQueued: 0,
     skippedType: 0,
     errors: 0,
   };
@@ -116,17 +126,28 @@ export async function importFolder(folder: string, deps: ImportDeps): Promise<Im
       continue;
     }
     const messageId = `sha1:${createHash('sha1').update(buffer).digest('hex')}`;
+    // Report these separately: dedup.has means the asset is genuinely already
+    // in Immich, but outbox.has only means it is staged and awaiting upload —
+    // conflating the two under one counter misreports hundreds of not-yet-
+    // uploaded photos as "already-synced" whenever the drain is behind.
     if (deps.dedup.has(messageId)) {
-      stats.skippedDedup += 1;
+      stats.skippedSynced += 1;
       continue;
     }
     if (deps.outbox.has(messageId)) {
-      stats.skippedDedup += 1;
+      stats.skippedQueued += 1;
       continue;
     }
 
     try {
-      const capturedAt = safeCapturedAtMs(dateForFile(path), statSync(path).mtimeMs);
+      // Date.now(), not another statSync(path): the fallback is unreachable
+      // today (see safeCapturedAtMs's doc comment) and mtimeMs was also
+      // circular whenever it WAS reachable — Stats.mtime is derived from
+      // mtimeMs, so an mtimeMs that made dateForFile's own NaN fallback fire
+      // would be NaN here too. statSync(path) also ran on every file
+      // regardless of whether dateForFile succeeded, which is a needless
+      // syscall per file on a large export.
+      const capturedAt = safeCapturedAtMs(dateForFile(path), Date.now());
 
       // Bytes to disk FIRST, row second — same ordering as the live ingest
       // path in ./ingest.ts. A crash between the two leaves an orphan file

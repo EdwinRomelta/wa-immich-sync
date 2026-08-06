@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { AppConfig } from './types.ts';
+import type { OverlapGuard } from './sync/staging.ts';
 
 let dotenvLoaded = false;
 function ensureDotenv(): void {
@@ -93,6 +94,23 @@ function intEnv(name: string, dflt: number): number {
 export function getOutboxDir(): string {
   ensureDotenv();
   return process.env.OUTBOX_DIR ?? './data/outbox';
+}
+
+/**
+ * Paths `ensureOutboxDirWritable`'s overlap guard must never let OUTBOX_DIR
+ * reach: the dedup db file and the WhatsApp auth dir. Every caller of
+ * `ensureOutboxDirWritable` MUST pass this list — a caller that omits it (as
+ * `scripts/import-export.ts` once did) makes the overlap check a silent
+ * no-op, letting OUTBOX_DIR=./data plant the outbox marker next to
+ * synced.db/auth/ and stage media the daemon's own guard then refuses to
+ * boot on, leaving it undrained. Defined once here, rather than inlined at
+ * each call site, so the two sites cannot drift apart again.
+ */
+export function outboxGuards(): OverlapGuard[] {
+  return [
+    { label: 'DEDUP_DB', path: getDedupDb() },
+    { label: 'WA_AUTH_DIR', path: getWaAuthDir() },
+  ];
 }
 
 /** Drain loop tuning. Defaults per the Phase 1 design spec and `startDrain`'s own fallbacks. */

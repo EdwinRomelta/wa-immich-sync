@@ -1,4 +1,4 @@
-import type { MediaItem, UploadResult } from '../types.ts';
+import type { UploadResult } from '../types.ts';
 
 export interface ImmichClientOptions {
   baseUrl: string;
@@ -57,12 +57,6 @@ export class ImmichClient {
     if (!res.ok) {
       throw new Error(`Immich ping failed (${res.status}): ${await safeText(res)}`);
     }
-  }
-
-  /** Upload one asset. Immich dedupes by checksum and may return status 'duplicate'. */
-  async uploadAsset(item: MediaItem): Promise<UploadResult> {
-    const blob = new Blob([new Uint8Array(item.buffer)], { type: item.mimeType });
-    return this.uploadBlob(blob, item);
   }
 
   /**

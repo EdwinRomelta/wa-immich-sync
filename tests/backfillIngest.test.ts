@@ -1,7 +1,7 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import AdmZip from 'adm-zip';
 import type { WAMessage } from '@whiskeysockets/baileys';
 import { openDb } from '../src/sync/db.ts';
@@ -17,11 +17,18 @@ function zipWith(files: Record<string, Buffer>): Buffer {
   return zip.toBuffer();
 }
 
+let dirs: string[] = [];
+afterEach(() => {
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  dirs = [];
+});
+
 function makeDeps(overrides: Partial<Record<string, unknown>> = {}) {
   const db = openDb(':memory:');
   const dedup = new DedupStore(db);
   const outbox = new OutboxStore(db);
   const outboxDir = mkdtempSync(join(tmpdir(), 'backfill-outbox-'));
+  dirs.push(outboxDir);
   return { outbox, dedup, outboxDir, logger, defaultAlbum: 'Default', ...overrides };
 }
 
@@ -88,6 +95,10 @@ describe('handleBackfillMessage', () => {
     // has identical content and must be skipped as a dedup, not re-queued.
     expect(deps.outbox.due(Date.now(), 10)).toHaveLength(1);
     const calls = sendMessage2.mock.calls as unknown as Array<[string, { text: string }]>;
-    expect(calls[0][1].text).toContain('already-synced: 1');
+    // The row from the first import is only in the outbox — `synced` is
+    // provably empty here, nothing has been uploaded to Immich yet — so the
+    // reply must report it as "already queued", never "already in Immich".
+    expect(calls[0][1].text).toContain('already queued: 1');
+    expect(calls[0][1].text).toContain('already in Immich: 0');
   });
 });

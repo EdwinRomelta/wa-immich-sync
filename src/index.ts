@@ -1,5 +1,13 @@
 import type { WAMessage } from '@whiskeysockets/baileys';
-import { getDedupDb, getDrainSettings, getOutboxDir, getWaAuthDir, loadConfig, loadImmichEnv } from './config.ts';
+import {
+  getDedupDb,
+  getDrainSettings,
+  getOutboxDir,
+  getWaAuthDir,
+  loadConfig,
+  loadImmichEnv,
+  outboxGuards,
+} from './config.ts';
 import { logger } from './logger.ts';
 import { ImmichClient } from './immich/client.ts';
 import { openDb } from './sync/db.ts';
@@ -44,7 +52,6 @@ async function main(): Promise<void> {
   // outbox it does, so WhatsApp connects immediately regardless of Immich.
   const outboxDir = getOutboxDir();
   const dedupDb = getDedupDb();
-  const waAuthDir = getWaAuthDir();
   // The startup sweep below deletes every regular file it doesn't recognise
   // from outboxDir. If OUTBOX_DIR is ever misconfigured to overlap the dedup
   // db file or the WhatsApp auth dir — a one-character `.env` edit, e.g.
@@ -54,11 +61,10 @@ async function main(): Promise<void> {
   // defaults (OUTBOX_DIR=./data/outbox, DEDUP_DB=./data/synced.db,
   // WA_AUTH_DIR=./data/auth) are siblings under ./data by design, and
   // guarding on dirname(dedupDb) would flag that entirely safe default as an
-  // overlap.
-  await ensureOutboxDirWritable(outboxDir, [
-    { label: 'DEDUP_DB', path: dedupDb },
-    { label: 'WA_AUTH_DIR', path: waAuthDir },
-  ]);
+  // overlap. The guard list itself lives in outboxGuards() (src/config.ts) so
+  // this daemon and scripts/import-export.ts — the other caller of
+  // ensureOutboxDirWritable — cannot drift apart and silently drop the check.
+  await ensureOutboxDirWritable(outboxDir, outboxGuards());
 
   const db = openDb(dedupDb);
   // DedupStore must be constructed before OutboxStore on this shared

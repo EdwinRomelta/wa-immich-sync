@@ -11,5 +11,12 @@ export function openDb(path: string): Database.Database {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.pragma('journal_mode = WAL');
+  // WAL's default synchronous level is NORMAL, which fsyncs the WAL only at
+  // checkpoints — a commit can return success and still be lost on power
+  // loss. staging.ts's fsync-the-parent-directory argument (and the wider
+  // stage-bytes-then-insert-row ordering the outbox depends on) is written
+  // assuming a committed outbox row is durable; that assumption is false
+  // under NORMAL. FULL fsyncs the WAL on every commit, closing that gap.
+  db.pragma('synchronous = FULL');
   return db;
 }

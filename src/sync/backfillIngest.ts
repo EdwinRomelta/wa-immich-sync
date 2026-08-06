@@ -95,10 +95,16 @@ export async function handleBackfillMessage(
     deps.logger.info({ ...stats, album: albumName }, 'backfill: import complete');
 
     if (jid) {
+      // "already in Immich" and "already queued" are kept separate — the
+      // latter is staged but NOT yet uploaded, and folding it into one
+      // "already-synced" counter would tell the operator hundreds of photos
+      // are safe in Immich when they are only sitting in the outbox waiting
+      // on a drain that may be hours behind.
       const summary =
         `Backfill queued -> album "${albumName}"\n` +
-        `queued: ${stats.queued}, already-synced: ${stats.skippedDedup}, ` +
-        `non-media: ${stats.skippedType}, errors: ${stats.errors}\n` +
+        `queued: ${stats.queued}, already in Immich: ${stats.skippedSynced}, ` +
+        `already queued: ${stats.skippedQueued}, non-media: ${stats.skippedType}, ` +
+        `errors: ${stats.errors}\n` +
         `Uploading to Immich in the background.`;
       await sock.sendMessage(jid, { text: summary });
     }
