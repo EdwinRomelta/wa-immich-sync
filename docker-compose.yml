@@ -12,6 +12,11 @@ services:
     # PID 1 must reap zombies and forward SIGTERM to the app so its shutdown
     # handler closes the sqlite db cleanly.
     init: true
+    # The app's own graceful-shutdown timeout is 8s (src/index.ts). Give
+    # Docker a larger budget than that so its SIGKILL-after-grace-period
+    # is never the thing that actually stops the process — a bounded,
+    # logged shutdown should always win the race.
+    stop_grace_period: 30s
     # Run as a non-root user so files written to ./data stay user-owned.
     # Set to your own uid:gid if different (see `id -u` / `id -g`).
     user: "1000:1000"

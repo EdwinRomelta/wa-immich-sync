@@ -628,6 +628,25 @@ describe('drain', () => {
       }
     });
 
+    it('tick() rejects when called directly and outbox.due throws, so callers MUST .catch() it (M5)', async () => {
+      // The internal `loop()` always wraps tick() in .catch() (see the C1
+      // test above), which is why that path never produces an unhandled
+      // rejection. index.ts now also calls drain.tick() directly once at
+      // boot, to drain a backlog immediately instead of waiting out the
+      // first DRAIN_INTERVAL_MS — bypassing loop()'s own .catch(). This
+      // proves the promise tick() returns really can reject (better-sqlite3
+      // calls inside tickAt are synchronous and sit outside any try/catch of
+      // tickAt's own), so that direct call is only safe because it is itself
+      // chained with .catch() in index.ts.
+      const { deps, outbox } = mockDeps({ autoStart: false });
+      outbox.due.mockImplementation(() => {
+        throw new Error('disk full');
+      });
+
+      const drain = startDrain(deps);
+      await expect(drain.tick()).rejects.toThrow('disk full');
+    });
+
     it('tick() called while a tick is in flight returns the same run instead of starting a second (M3)', async () => {
       const { deps, outbox, immich } = mockDeps({ autoStart: false });
       let resolveUpload: (() => void) | null = null;

@@ -42,8 +42,15 @@ export class ImmichClient {
   }
 
   /**
-   * Liveness probe. Throws while Immich is unreachable or still booting, so
-   * callers can hold work (e.g. the WhatsApp connect) until uploads can land.
+   * Liveness probe. Throws while Immich is unreachable or still booting.
+   *
+   * Nothing in the daemon's startup path blocks on this any more — ingest
+   * stages media to disk regardless of whether Immich is reachable, and
+   * `drain` retries uploads with backoff until it answers, so there is no
+   * gate left for this to hold open. Kept as a small, direct yes/no
+   * readiness check for callers outside that flow — CLI tooling, a
+   * monitoring probe, a manual sanity check against IMMICH_URL — rather than
+   * as a precondition anything here waits on.
    */
   async ping(): Promise<void> {
     const res = await this.fetch(`${this.baseUrl}/api/server/ping`, { headers: this.headers() });

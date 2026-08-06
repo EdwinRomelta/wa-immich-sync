@@ -1,5 +1,3 @@
-import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import type { WAMessage } from '@whiskeysockets/baileys';
 import { getDedupDb, getDrainSettings, getOutboxDir, getWaAuthDir, loadConfig, loadImmichEnv } from './config.ts';
 import { logger } from './logger.ts';
@@ -9,7 +7,7 @@ import { DedupStore } from './sync/dedupStore.ts';
 import { OutboxStore } from './sync/outboxStore.ts';
 import { createIngest } from './sync/ingest.ts';
 import { startDrain } from './sync/drain.ts';
-import { sweepOrphans } from './sync/staging.ts';
+import { ensureOutboxDirWritable, sweepOrphans } from './sync/staging.ts';
 import { OldestAnchors, startBackfill } from './sync/backfill.ts';
 import { handleBackfillMessage } from './sync/backfillIngest.ts';
 import { resolveWhitelist } from './wa/groupResolver.ts';
@@ -20,23 +18,6 @@ import { createGate } from './util/gate.ts';
 function tsSecOf(m: WAMessage): number {
   const raw = m.messageTimestamp;
   return typeof raw === 'number' ? raw : Number(raw ?? 0);
-}
-
-/**
- * Create the outbox staging directory and confirm it is actually writable.
- *
- * Without this, a misconfigured OUTBOX_DIR (bad permissions, a bind mount not
- * ready yet, a typo'd path) makes ingest fail silently and repeatedly: every
- * single WhatsApp message returns 'error' forever, one log line at a time,
- * while traffic streams past unrecorded. This is the one startup check that
- * SHOULD block — unlike the Immich readiness gate removed below, there is no
- * safe way to proceed without a writable place to put bytes.
- */
-async function ensureOutboxDirWritable(dir: string): Promise<void> {
-  await mkdir(dir, { recursive: true });
-  const probePath = join(dir, '.write-probe');
-  await writeFile(probePath, '');
-  await rm(probePath, { force: true });
 }
 
 async function main(): Promise<void> {
@@ -62,9 +43,24 @@ async function main(): Promise<void> {
   // existed because an in-flight message had nowhere safe to go. With the
   // outbox it does, so WhatsApp connects immediately regardless of Immich.
   const outboxDir = getOutboxDir();
-  await ensureOutboxDirWritable(outboxDir);
+  const dedupDb = getDedupDb();
+  const waAuthDir = getWaAuthDir();
+  // The startup sweep below deletes every regular file it doesn't recognise
+  // from outboxDir. If OUTBOX_DIR is ever misconfigured to overlap the dedup
+  // db file or the WhatsApp auth dir — a one-character `.env` edit, e.g.
+  // OUTBOX_DIR=./data — that sweep deletes synced.db or creds.json instead of
+  // orphaned staged media. Refuse to start rather than risk it. Guarded with
+  // the dedup db's own file path, not its parent directory: the shipped
+  // defaults (OUTBOX_DIR=./data/outbox, DEDUP_DB=./data/synced.db,
+  // WA_AUTH_DIR=./data/auth) are siblings under ./data by design, and
+  // guarding on dirname(dedupDb) would flag that entirely safe default as an
+  // overlap.
+  await ensureOutboxDirWritable(outboxDir, [
+    { label: 'DEDUP_DB', path: dedupDb },
+    { label: 'WA_AUTH_DIR', path: waAuthDir },
+  ]);
 
-  const db = openDb(getDedupDb());
+  const db = openDb(dedupDb);
   // DedupStore must be constructed before OutboxStore on this shared
   // connection: OutboxStore.markSyncedAndRemove writes to the `synced` table
   // that DedupStore's constructor creates.
@@ -79,6 +75,17 @@ async function main(): Promise<void> {
   const drainSettings = getDrainSettings();
   const drain = startDrain({ immich, outbox, logger, ...drainSettings });
   logger.info({ ...drainSettings, outboxDir, pending: outbox.depth() }, 'drain started');
+  // Run a first pass immediately instead of waiting out the full
+  // DRAIN_INTERVAL_MS (30s default): otherwise a backlog built up while the
+  // process was down sits idle after every boot for no reason. tick()'s
+  // re-entrancy guard makes an overlapping call from the timer loop safe,
+  // but its returned promise CAN reject (synchronous better-sqlite3 calls
+  // sit outside its own try/catch) — left uncaught, that becomes an
+  // unhandled rejection that kills the process, and with `restart: always`
+  // in docker-compose.yml, a crash loop that also drops the WhatsApp socket.
+  void drain.tick().catch((err) => {
+    logger.error({ err: (err as Error).message }, 'drain: initial tick failed');
+  });
 
   // Backfill cursor: oldest seen message per whitelisted group, fed by both
   // history and live messages, paged backwards via fetchMessageHistory. The
@@ -221,22 +228,62 @@ async function main(): Promise<void> {
     },
   });
 
-  // Re-entrancy guard: a second SIGTERM/SIGINT arriving while shutdown is
-  // already in flight must not race a second drain.stop()/dedup.close() pair
-  // against the first. The flag is set synchronously before the first
-  // `await`, so a signal that arrives after that point sees it immediately.
-  let shuttingDown = false;
+  // How long a graceful shutdown is given before it's forced. drain.stop()
+  // waits out a whole in-flight tick — up to batchSize (10) sequential
+  // uploads with no per-row timeout — so an unbounded wait here has no upper
+  // bound either. docker-compose.yml sets stop_grace_period well above this
+  // so Docker's SIGKILL budget is never the tighter constraint.
+  const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 8_000;
+
+  // Signal counter, not a boolean re-entrancy guard: a boolean would make a
+  // SECOND SIGTERM/SIGINT arriving mid-shutdown a silent no-op, leaving the
+  // operator with no escape hatch while drain.stop() waits out a slow
+  // upload — Ctrl-C stops working, and `docker compose restart` just waits
+  // out its grace period and SIGKILLs (exit 137, not 0). The first signal
+  // still shuts down gracefully; only the second forces an immediate exit.
+  let shutdownSignals = 0;
   const shutdown = async (): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+    shutdownSignals += 1;
+    if (shutdownSignals > 1) {
+      logger.warn('second shutdown signal received — exiting immediately');
+      process.exit(130);
+      return;
+    }
     logger.info('shutting down');
-    // Must be awaited: drain.stop() waits for any in-flight tick to finish
-    // before returning. Closing the shared sqlite handle underneath a live
-    // markSyncedAndRemove/defer call throws inside a timer callback and would
-    // exit the container with code 1 instead of 0 — docker-compose.yml sets
-    // `init: true` specifically so this handler can close sqlite cleanly.
-    await drain.stop();
-    dedup.close();
+
+    // Bounded, not unbounded: race drain.stop() against a timeout so a slow
+    // batch can't hang shutdown forever. `.unref()` the timer so it can never
+    // itself keep the process alive if drain.stop() wins the race first.
+    await new Promise<void>((resolveShutdown) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        resolveShutdown();
+      };
+      const timer = setTimeout(() => {
+        logger.warn({ timeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS }, 'drain.stop() timed out; closing anyway');
+        finish();
+      }, GRACEFUL_SHUTDOWN_TIMEOUT_MS);
+      timer.unref();
+      void drain.stop().finally(() => {
+        clearTimeout(timer);
+        finish();
+      });
+    });
+
+    // Must not let a throwing close() skip process.exit(0): an uncaught
+    // rejection here would escape `void shutdown()` and, on Node 22, turn a
+    // clean shutdown into a non-zero exit — the exact outcome this handler
+    // exists to prevent. This also covers the timeout path above, where
+    // close() may now run underneath a write drain.stop() never finished
+    // waiting for. docker-compose.yml sets `init: true` so this handler gets
+    // to run at all when SIGTERM arrives.
+    try {
+      dedup.close();
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, 'dedup.close() failed during shutdown');
+    }
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());

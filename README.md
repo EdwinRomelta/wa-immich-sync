@@ -29,19 +29,22 @@ pushes every new image/video to Immich. Uploads are idempotent, so it is safe to
 WhatsApp (linked device)
    │  messages.upsert (live)  +  messaging-history.set (best-effort backfill)
    ▼
-src/wa/client.ts ──▶ src/sync/pipeline.ts
-                        │ 1. filter to whitelisted groups (resolved from names/JIDs)
-                        │ 2. extract image/video       (src/wa/mediaExtractor.ts)
-                        │ 3. dedup check               (src/sync/dedupStore.ts, sqlite)
-                        │ 4. upload to Immich          (src/immich/client.ts)
-                        │ 5. add to album
-                        └ 6. mark done
-                        ▼
-                  Immich server
+src/wa/client.ts ──▶ src/sync/ingest.ts ──▶ outbox (sqlite rows + staged files) ──▶ src/sync/drain.ts ──▶ Immich
+                        │ 1. filter to whitelisted groups (resolved from names/JIDs)     │ 1. upload      (src/immich/client.ts)
+                        │ 2. extract image/video       (src/wa/mediaExtractor.ts)        │ 2. add to album
+                        │ 3. dedup check                (src/sync/dedupStore.ts, sqlite) └ 3. mark synced, remove row + file
+                        └ 4. stage bytes to disk, insert an outbox row (src/sync/staging.ts)
 
 Backfill group ──▶ src/sync/backfillIngest.ts ──▶ src/sync/importFolder.ts ──▶ Immich
    (a .zip document is downloaded, unzipped, and every photo/video imported)
 ```
+
+Media is durable on disk — fsynced, then the outbox row committed to sqlite — before any upload is
+even attempted. `ingest` never talks to Immich directly, so an Immich outage never blocks WhatsApp
+or drops a message: it just staged, waiting for `drain` to catch up. `drain` runs on a timer (plus
+an immediate first pass on boot so a backlog doesn't sit idle), retries failed uploads with
+exponential backoff, and only removes a row (and its staged file) once Immich confirms the upload.
+A startup sweep clears any staged file left behind by a crash between staging and the row insert.
 
 ## Prerequisites
 
@@ -104,6 +107,13 @@ All configuration is via environment variables (see `.env.example`):
 | `BACKFILL` | | `true` | Request WhatsApp history sync on link |
 | `WA_AUTH_DIR` | | `./data/auth` | Where Baileys stores auth |
 | `DEDUP_DB` | | `./data/synced.db` | sqlite dedup database |
+| `OUTBOX_DIR` | | `./data/outbox` | Where media is staged before upload. Must not overlap `WA_AUTH_DIR` or `DEDUP_DB`'s directory — the daemon refuses to start if it does, since its startup sweep deletes unrecognised files from this directory. |
+| `DRAIN_INTERVAL_MS` | | `30000` | How often the drain loop checks for due rows (plus one immediate pass on boot) |
+| `DRAIN_BATCH_SIZE` | | `10` | Rows processed per drain tick |
+| `DRAIN_BASE_BACKOFF_MS` | | `30000` | Starting delay before a failed upload is retried |
+| `DRAIN_MAX_BACKOFF_MS` | | `3600000` | Backoff ceiling; raised to `DRAIN_BASE_BACKOFF_MS` if set lower |
+| `DRAIN_DROP_AFTER_ATTEMPTS` | | `3` | Retries a row earns before an unusable staged file is treated as terminal and dropped |
+| `DRAIN_MAX_DROPS_PER_TICK` | | `5` | Cap on terminal drops per tick, so a directory outage can't empty the queue |
 
 **Whitelist by name or JID.** Each `WHITELIST_GROUPS` entry is matched by group name, or treated
 as an exact JID if it contains `@g.us`. If a name matches **multiple** groups, all of them are

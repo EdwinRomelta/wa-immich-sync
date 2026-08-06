@@ -1,6 +1,62 @@
 import { createHash } from 'node:crypto';
-import { mkdir, open, readdir, rename, rm } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { mkdir, open, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+
+/**
+ * Marker written into the staging directory the first time it is prepared.
+ * Its presence is what tells `sweepOrphans` "this directory is genuinely an
+ * outbox staging area, safe to delete unreferenced files from" — see the
+ * doc comment on `sweepOrphans` for why that distinction exists.
+ */
+export const OUTBOX_MARKER_FILE = '.wa-outbox';
+
+/** A path `ensureOutboxDirWritable` must refuse to let the staging dir overlap. */
+export interface OverlapGuard {
+  /** Human-readable name used in the thrown error, e.g. "DEDUP_DB". */
+  label: string;
+  /**
+   * The thing to guard — pass the actual path that must never be reachable
+   * by a directory sweep. For a single file (e.g. the dedup db), pass the
+   * file's own path, not its parent directory: the shipped defaults put
+   * OUTBOX_DIR, DEDUP_DB, and WA_AUTH_DIR as siblings under the same `./data`
+   * parent, so guarding on that shared parent directory would flag the
+   * default configuration itself as an overlap. For a directory (e.g. the WA
+   * auth dir), pass the directory itself.
+   */
+  path: string;
+}
+
+/** True when `other` is `ancestor` itself, or lives anywhere underneath it. */
+function isSameOrWithin(ancestor: string, other: string): boolean {
+  if (ancestor === other) return true;
+  const rel = relative(ancestor, other);
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+/**
+ * Refuse to proceed if the staging directory is the same as, contains, or is
+ * contained by, any guarded path. `sweepOrphans` deletes every regular file
+ * it doesn't recognise from the staging directory; if that directory turns
+ * out to BE (or to sit inside, or to sit around) a guarded path, the next
+ * sweep can delete `synced.db` or `creds.json` instead of orphaned staged
+ * media. Both containment directions matter: `OUTBOX_DIR=./data` puts the
+ * dedup db file *inside* the staging dir, while `OUTBOX_DIR=./data/auth`
+ * puts the staging dir itself *inside* the WA auth dir — either way the
+ * sweep can reach files it must never touch.
+ */
+export function assertNoOverlap(stagingDir: string, guards: OverlapGuard[]): void {
+  const staging = resolve(stagingDir);
+  for (const guard of guards) {
+    const other = resolve(guard.path);
+    if (isSameOrWithin(staging, other) || isSameOrWithin(other, staging)) {
+      throw new Error(
+        `OUTBOX_DIR (${stagingDir}) overlaps with ${guard.label} (${guard.path}); refusing to ` +
+          'start, since the startup orphan sweep would be able to delete files there. Point ' +
+          'OUTBOX_DIR at a directory used for nothing else.',
+      );
+    }
+  }
+}
 
 /** Longest sanitised prefix kept before the digest, so names stay under NAME_MAX. */
 const MAX_NAME_PREFIX = 120;
@@ -65,9 +121,49 @@ async function syncDir(dir: string): Promise<void> {
 }
 
 /**
+ * Create the outbox staging directory, confirm it is actually writable, and
+ * mark it so `sweepOrphans` can recognise it as its own later.
+ *
+ * Without the write probe, a misconfigured OUTBOX_DIR (bad permissions, a
+ * bind mount not ready yet, a typo'd path) makes ingest fail silently and
+ * repeatedly: every single WhatsApp message returns 'error' forever, one log
+ * line at a time, while traffic streams past unrecorded. This is the one
+ * startup check that SHOULD block — unlike the Immich readiness gate, there
+ * is no safe way to proceed without a writable place to put bytes.
+ *
+ * `guards` should name every path that must never be reachable by the
+ * startup sweep (the dedup db file, the WhatsApp auth dir) — see
+ * `assertNoOverlap`. Callers pass these in rather than this module reading
+ * them from config, so staging.ts stays free of env access and unit
+ * testable.
+ */
+export async function ensureOutboxDirWritable(dir: string, guards: OverlapGuard[] = []): Promise<void> {
+  assertNoOverlap(dir, guards);
+  await mkdir(dir, { recursive: true });
+  const probePath = join(dir, '.write-probe');
+  await writeFile(probePath, '');
+  await rm(probePath, { force: true });
+  // Written last, once the directory is confirmed writable: its presence is
+  // what tells sweepOrphans (below) that this directory is a real outbox
+  // staging area and not some arbitrary non-empty directory OUTBOX_DIR was
+  // accidentally repointed at.
+  await writeFile(join(dir, OUTBOX_MARKER_FILE), '');
+}
+
+/**
  * Delete staged files that no queue row references, plus any leftover temp
  * files. Run at startup: a crash between the rename and the row insert leaves
  * exactly this kind of orphan.
+ *
+ * A non-empty directory with no `OUTBOX_MARKER_FILE` is refused outright,
+ * rather than swept. The overlap check in `ensureOutboxDirWritable` guards
+ * the specific paths known at startup (the dedup db file, the WA auth dir),
+ * but it can't guard against every possible future repoint of OUTBOX_DIR onto
+ * arbitrary user data. The marker is the second, independent line of defense: it only
+ * appears in a directory this code itself prepared, so a directory that's
+ * merely non-empty (an unrelated folder, a mistake, a home directory) is
+ * left alone instead of having its files deleted. An empty directory sweeps
+ * fine without a marker — there's nothing there to protect yet.
  */
 export async function sweepOrphans(dir: string, keep: string[]): Promise<number> {
   let entries;
@@ -81,12 +177,22 @@ export async function sweepOrphans(dir: string, keep: string[]): Promise<number>
     throw err;
   }
 
+  const hasMarker = entries.some((e) => e.name === OUTBOX_MARKER_FILE && e.isFile());
+  if (entries.length > 0 && !hasMarker) {
+    throw new Error(
+      `refusing to sweep ${dir}: it is non-empty and has no ${OUTBOX_MARKER_FILE} marker, so it ` +
+        "does not look like an outbox staging directory. Run ensureOutboxDirWritable() first, or " +
+        'point OUTBOX_DIR somewhere else.',
+    );
+  }
+
   await rm(join(dir, 'tmp'), { recursive: true, force: true });
 
   // Compare within this directory only: a stale row pointing at a previous
   // staging location must not shield a same-named orphan here.
   const here = resolve(dir);
   const keepSet = new Set(keep.filter((p) => resolve(dirname(p)) === here).map((p) => basename(p)));
+  keepSet.add(OUTBOX_MARKER_FILE);
 
   let removed = 0;
   for (const entry of entries) {
