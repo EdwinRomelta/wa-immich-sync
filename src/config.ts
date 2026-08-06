@@ -107,11 +107,15 @@ export function getDrainSettings(): {
   maxDropsPerTick: number;
 } {
   ensureDotenv();
+  const baseBackoffMs = intEnv('DRAIN_BASE_BACKOFF_MS', 30_000);
   return {
     intervalMs: intEnv('DRAIN_INTERVAL_MS', 30_000),
     batchSize: intEnv('DRAIN_BATCH_SIZE', 10),
-    baseBackoffMs: intEnv('DRAIN_BASE_BACKOFF_MS', 30_000),
-    maxBackoffMs: intEnv('DRAIN_MAX_BACKOFF_MS', 3_600_000),
+    baseBackoffMs,
+    // A ceiling below the floor is a misconfiguration, not an intent to retry
+    // fast: backoffDelayMs clamps to maxMs, so it would silently turn
+    // exponential backoff into a fixed delay. Raise it to the floor instead.
+    maxBackoffMs: Math.max(baseBackoffMs, intEnv('DRAIN_MAX_BACKOFF_MS', 3_600_000)),
     dropAfterAttempts: intEnv('DRAIN_DROP_AFTER_ATTEMPTS', 3),
     maxDropsPerTick: intEnv('DRAIN_MAX_DROPS_PER_TICK', 5),
   };

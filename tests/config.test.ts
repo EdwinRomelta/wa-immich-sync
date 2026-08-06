@@ -74,6 +74,17 @@ describe('outbox settings', () => {
     expect(getOutboxDir()).toBe('./data/outbox');
   });
 
+  it('never lets the backoff ceiling fall below the floor', () => {
+    // backoffDelayMs clamps to maxMs, so a ceiling under the floor would
+    // silently flatten exponential backoff into a fixed retry delay.
+    process.env.DRAIN_BASE_BACKOFF_MS = '30000';
+    process.env.DRAIN_MAX_BACKOFF_MS = '1000';
+    const s = getDrainSettings();
+    expect(s.maxBackoffMs).toBe(30_000);
+    delete process.env.DRAIN_BASE_BACKOFF_MS;
+    delete process.env.DRAIN_MAX_BACKOFF_MS;
+  });
+
   it('honours OUTBOX_DIR when set', () => {
     process.env.OUTBOX_DIR = '/mnt/staging';
     expect(getOutboxDir()).toBe('/mnt/staging');
