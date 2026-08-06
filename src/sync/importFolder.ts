@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { extname, join, relative } from 'node:path';
-import type { ImmichClient } from '../immich/client.ts';
 import type { DedupStore } from './dedupStore.ts';
-import type { MediaItem, MediaKind } from '../types.ts';
+import type { OutboxStore } from './outboxStore.ts';
+import { stageFile } from './staging.ts';
+import type { MediaKind } from '../types.ts';
 
 export const MEDIA_MIME: Record<string, { kind: MediaKind; mime: string }> = {
   '.jpg': { kind: 'image', mime: 'image/jpeg' },
@@ -22,16 +24,17 @@ export const MEDIA_MIME: Record<string, { kind: MediaKind; mime: string }> = {
 
 export interface ImportStats {
   scanned: number;
-  uploaded: number;
-  duplicate: number;
+  queued: number;
   skippedDedup: number;
   skippedType: number;
   errors: number;
 }
 
 export interface ImportDeps {
-  immich: Pick<ImmichClient, 'uploadAsset' | 'ensureAlbum' | 'addToAlbum'>;
-  dedup: Pick<DedupStore, 'has' | 'markDone'>;
+  outbox: Pick<OutboxStore, 'has' | 'enqueue'>;
+  dedup: Pick<DedupStore, 'has'>;
+  /** Directory staged media is written to. */
+  outboxDir: string;
   albumName: string;
   logger: { info: (...a: unknown[]) => void; warn: (...a: unknown[]) => void };
 }
@@ -62,19 +65,33 @@ export function dateForFile(path: string): Date {
 }
 
 /**
- * Walk a folder and upload every supported image/video to Immich, adding each
- * to `albumName` (unless empty) and recording dedup keys so re-runs skip work.
+ * Guard against `dateForFile` (or a future regression in it) returning an
+ * Invalid Date. `OutboxStore.enqueue` writes `captured_at` as `NOT NULL`;
+ * `Invalid Date.getTime()` is `NaN`, better-sqlite3 binds `NaN` as `NULL`,
+ * and the insert throws `NOT NULL constraint failed: outbox.captured_at`.
+ * The live ingest path takes its timestamp from WhatsApp (already guarded);
+ * this path parses it out of export filenames — a much weaker source — so
+ * fall back to a known-valid timestamp rather than letting the insert fail.
+ */
+export function safeCapturedAtMs(date: Date, fallbackMs: number): number {
+  return Number.isNaN(date.getTime()) ? fallbackMs : date.getTime();
+}
+
+/**
+ * Walk a folder and queue every supported image/video for upload via the
+ * outbox, adding each to `albumName` (unless empty) and recording dedup keys
+ * so re-runs skip work. Deliberately knows nothing about Immich — matches
+ * the live ingest path in ./ingest.ts, which the outbox exists to replace
+ * the direct-upload behaviour of.
  */
 export async function importFolder(folder: string, deps: ImportDeps): Promise<ImportStats> {
   const stats: ImportStats = {
     scanned: 0,
-    uploaded: 0,
-    duplicate: 0,
+    queued: 0,
     skippedDedup: 0,
     skippedType: 0,
     errors: 0,
   };
-  let albumId: string | null = null;
 
   for (const path of walk(folder)) {
     stats.scanned += 1;
@@ -103,30 +120,38 @@ export async function importFolder(folder: string, deps: ImportDeps): Promise<Im
       stats.skippedDedup += 1;
       continue;
     }
+    if (deps.outbox.has(messageId)) {
+      stats.skippedDedup += 1;
+      continue;
+    }
 
     try {
-      const item: MediaItem = {
-        messageId,
-        rawMessageId: rel,
-        groupJid: 'import',
-        groupName: deps.albumName,
-        kind: info.kind,
-        mimeType: info.mime,
-        fileName: path.split('/').pop() ?? rel,
-        timestamp: dateForFile(path),
-        buffer,
-      };
+      const capturedAt = safeCapturedAtMs(dateForFile(path), statSync(path).mtimeMs);
 
-      const uploaded = await deps.immich.uploadAsset(item);
-      if (deps.albumName) {
-        if (!albumId) albumId = await deps.immich.ensureAlbum(deps.albumName);
-        await deps.immich.addToAlbum(albumId, uploaded.assetId);
+      // Bytes to disk FIRST, row second — same ordering as the live ingest
+      // path in ./ingest.ts. A crash between the two leaves an orphan file
+      // (swept at startup), never a row without its media.
+      const filePath = await stageFile(deps.outboxDir, messageId, buffer);
+      try {
+        deps.outbox.enqueue({
+          messageId,
+          groupJid: 'import',
+          albumName: deps.albumName,
+          filePath,
+          fileName: path.split('/').pop() ?? rel,
+          mimeType: info.mime,
+          capturedAt,
+          createdAt: Date.now(),
+        });
+      } catch (err) {
+        // The row never landed, so nothing will ever reference these bytes.
+        // Drop them now rather than leaving an orphan for the startup sweep.
+        await rm(filePath, { force: true }).catch(() => {});
+        throw err;
       }
-      deps.dedup.markDone(messageId, 'import', uploaded.assetId, uploaded.status);
 
-      if (uploaded.status === 'duplicate') stats.duplicate += 1;
-      else stats.uploaded += 1;
-      if ((stats.uploaded + stats.duplicate) % 25 === 0) deps.logger.info(stats, 'import progress');
+      stats.queued += 1;
+      if (stats.queued % 25 === 0) deps.logger.info(stats, 'import progress');
     } catch (err) {
       stats.errors += 1;
       deps.logger.warn({ path: rel, err: (err as Error).message }, 'import failed for file');

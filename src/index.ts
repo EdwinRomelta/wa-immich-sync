@@ -137,8 +137,9 @@ async function main(): Promise<void> {
       // treated as normal media.
       if (backfillGroupJid && jid === backfillGroupJid) {
         const handled = await handleBackfillMessage(sock, m, {
-          immich,
+          outbox,
           dedup,
+          outboxDir,
           logger,
           defaultAlbum: backfillDefaultAlbum,
         });

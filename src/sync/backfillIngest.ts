@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import AdmZip from 'adm-zip';
 import { downloadMediaMessage, type WAMessage, type WASocket } from '@whiskeysockets/baileys';
-import type { ImmichClient } from '../immich/client.ts';
 import type { DedupStore } from './dedupStore.ts';
+import type { OutboxStore } from './outboxStore.ts';
 import { importFolder } from './importFolder.ts';
 
 type AnyMsg = Record<string, any> | null | undefined;
@@ -16,8 +16,9 @@ type IngestLogger = {
 };
 
 export interface BackfillIngestDeps {
-  immich: Pick<ImmichClient, 'uploadAsset' | 'ensureAlbum' | 'addToAlbum'>;
-  dedup: Pick<DedupStore, 'has' | 'markDone'>;
+  outbox: Pick<OutboxStore, 'has' | 'enqueue'>;
+  dedup: Pick<DedupStore, 'has'>;
+  outboxDir: string;
   logger: IngestLogger;
   /** Album used when a zip arrives with no caption. */
   defaultAlbum: string;
@@ -52,7 +53,8 @@ type DownloadSock = Pick<WASocket, 'updateMediaMessage' | 'sendMessage'>;
 /**
  * Handle a message in the dedicated backfill group. If it carries a `.zip`
  * document (a WhatsApp "Export chat with media" archive), download it, unzip
- * in a temp dir, import every photo/video to Immich, and reply with a summary.
+ * in a temp dir, queue every photo/video via the outbox (uploaded later by
+ * drain), and reply with a summary.
  *
  * Returns true if the message was a zip handled here, false otherwise.
  */
@@ -84,8 +86,9 @@ export async function handleBackfillMessage(
     new AdmZip(buffer).extractAllTo(tmp, /* overwrite */ true);
 
     const stats = await importFolder(tmp, {
-      immich: deps.immich,
+      outbox: deps.outbox,
       dedup: deps.dedup,
+      outboxDir: deps.outboxDir,
       albumName,
       logger: deps.logger,
     });
@@ -93,9 +96,10 @@ export async function handleBackfillMessage(
 
     if (jid) {
       const summary =
-        `✅ Backfill done → album "${albumName}"\n` +
-        `uploaded: ${stats.uploaded}, duplicate: ${stats.duplicate}, ` +
-        `already-synced: ${stats.skippedDedup}, non-media: ${stats.skippedType}, errors: ${stats.errors}`;
+        `Backfill queued -> album "${albumName}"\n` +
+        `queued: ${stats.queued}, already-synced: ${stats.skippedDedup}, ` +
+        `non-media: ${stats.skippedType}, errors: ${stats.errors}\n` +
+        `Uploading to Immich in the background.`;
       await sock.sendMessage(jid, { text: summary });
     }
   } catch (err) {

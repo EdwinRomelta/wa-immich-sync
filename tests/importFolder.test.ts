@@ -1,23 +1,20 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { importFolder } from '../src/sync/importFolder.ts';
+import { openDb } from '../src/sync/db.ts';
+import { DedupStore } from '../src/sync/dedupStore.ts';
+import { OutboxStore } from '../src/sync/outboxStore.ts';
+import { importFolder, safeCapturedAtMs } from '../src/sync/importFolder.ts';
 
 const logger = { info: vi.fn(), warn: vi.fn() };
 
-function makeDeps() {
-  const seen = new Set<string>();
-  const immich = {
-    uploadAsset: vi.fn(async () => ({ assetId: `a${Math.random()}`, status: 'created' as const })),
-    ensureAlbum: vi.fn(async () => 'album1'),
-    addToAlbum: vi.fn(async () => {}),
-  };
-  const dedup = {
-    has: (id: string) => seen.has(id),
-    markDone: (id: string) => void seen.add(id),
-  };
-  return { immich, dedup, albumName: 'A', logger };
+function makeDeps(overrides: Partial<{ albumName: string }> = {}) {
+  const db = openDb(':memory:');
+  const dedup = new DedupStore(db);
+  const outbox = new OutboxStore(db);
+  const outboxDir = mkdtempSync(join(tmpdir(), 'import-outbox-'));
+  return { outbox, dedup, outboxDir, albumName: 'A', logger, ...overrides };
 }
 
 let dirs: string[] = [];
@@ -32,7 +29,52 @@ afterEach(() => {
   dirs = [];
 });
 
-describe('importFolder content-hash dedup', () => {
+describe('importFolder', () => {
+  it('queues every supported file instead of uploading directly', async () => {
+    const db = openDb(':memory:');
+    const dedup = new DedupStore(db);
+    const outbox = new OutboxStore(db);
+    const outboxDir = mkdtempSync(join(tmpdir(), 'import-outbox-'));
+    const folder = mkdtempSync(join(tmpdir(), 'import-src-'));
+    writeFileSync(join(folder, 'IMG-20240617-WA0001.jpg'), 'aaa');
+    writeFileSync(join(folder, 'notes.txt'), 'ignore me');
+
+    const stats = await importFolder(folder, {
+      outbox,
+      dedup,
+      outboxDir,
+      albumName: 'Daycare',
+      logger: { info: vi.fn(), warn: vi.fn() },
+    });
+
+    expect(stats.queued).toBe(1);
+    expect(stats.skippedType).toBe(1);
+    const rows = outbox.due(Date.now(), 10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.albumName).toBe('Daycare');
+    expect(readFileSync(rows[0]!.filePath).toString()).toBe('aaa');
+
+    dirs.push(folder, outboxDir);
+  });
+
+  it('skips a file already queued or synced', async () => {
+    const db = openDb(':memory:');
+    const dedup = new DedupStore(db);
+    const outbox = new OutboxStore(db);
+    const outboxDir = mkdtempSync(join(tmpdir(), 'import-outbox-'));
+    const folder = mkdtempSync(join(tmpdir(), 'import-src-'));
+    writeFileSync(join(folder, 'IMG-20240617-WA0001.jpg'), 'aaa');
+    const deps = { outbox, dedup, outboxDir, albumName: 'D', logger: { info: vi.fn(), warn: vi.fn() } };
+
+    await importFolder(folder, deps);
+    const second = await importFolder(folder, deps);
+
+    expect(second.queued).toBe(0);
+    expect(second.skippedDedup).toBe(1);
+
+    dirs.push(folder, outboxDir);
+  });
+
   it('skips identical content under a different filename (re-export from another person)', async () => {
     const deps = makeDeps();
     const dir = tmp({
@@ -42,19 +84,56 @@ describe('importFolder content-hash dedup', () => {
       'notes.txt': 'ignored',
     });
     const stats = await importFolder(dir, deps);
-    expect(deps.immich.uploadAsset).toHaveBeenCalledTimes(2); // A once, B once
-    expect(stats.uploaded).toBe(2);
+    expect(stats.queued).toBe(2); // A once, B once
     expect(stats.skippedDedup).toBe(1);
     expect(stats.skippedType).toBe(1); // notes.txt
+
+    dirs.push(deps.outboxDir);
   });
 
   it('skips everything on a re-run (content already recorded)', async () => {
     const deps = makeDeps();
     const dir = tmp({ 'IMG-20240101-WA0001.jpg': Buffer.from('X') });
     await importFolder(dir, deps);
-    deps.immich.uploadAsset.mockClear();
     const stats2 = await importFolder(dir, deps);
-    expect(deps.immich.uploadAsset).not.toHaveBeenCalled();
+    expect(stats2.queued).toBe(0);
     expect(stats2.skippedDedup).toBe(1);
+
+    dirs.push(deps.outboxDir);
+  });
+
+  it('imports a file whose name defeats the date parser instead of erroring', async () => {
+    // Neither the IMG-/VID- pattern nor the "WhatsApp Image ..." pattern
+    // matches this name, so dateForFile() falls through to statSync(path).mtime.
+    const deps = makeDeps();
+    const dir = tmp({ 'totally-unparseable-name.jpg': Buffer.from('bytes') });
+    const filePath = join(dir, 'totally-unparseable-name.jpg');
+    const mtimeMs = statSync(filePath).mtimeMs;
+
+    const stats = await importFolder(dir, deps);
+
+    expect(stats.errors).toBe(0);
+    expect(stats.queued).toBe(1);
+    const rows = deps.outbox.due(Date.now(), 10);
+    expect(rows).toHaveLength(1);
+    // capturedAt must be a valid, finite timestamp — never NaN — and close to
+    // the file's own mtime, since that's the fallback source.
+    expect(Number.isFinite(rows[0]!.capturedAt)).toBe(true);
+    expect(Math.abs(rows[0]!.capturedAt - mtimeMs)).toBeLessThan(60_000);
+
+    dirs.push(deps.outboxDir);
+  });
+});
+
+describe('safeCapturedAtMs (NOT NULL guard on outbox.captured_at)', () => {
+  it('falls back when the parsed date is invalid, so enqueue never sees NaN', () => {
+    const invalid = new Date(NaN);
+    expect(Number.isNaN(invalid.getTime())).toBe(true); // sanity: reproduces the real failure mode
+    expect(safeCapturedAtMs(invalid, 12345)).toBe(12345);
+  });
+
+  it('passes the real timestamp through unchanged when the date is valid', () => {
+    const valid = new Date(2024, 5, 17);
+    expect(safeCapturedAtMs(valid, 999)).toBe(valid.getTime());
   });
 });

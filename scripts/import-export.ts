@@ -1,16 +1,23 @@
 import { statSync } from 'node:fs';
-import { getDedupDb, loadConfig, loadImmichEnv } from '../src/config.ts';
+import { getDedupDb, getOutboxDir, loadConfig } from '../src/config.ts';
 import { logger } from '../src/logger.ts';
-import { ImmichClient } from '../src/immich/client.ts';
+import { openDb } from '../src/sync/db.ts';
 import { DedupStore } from '../src/sync/dedupStore.ts';
+import { OutboxStore } from '../src/sync/outboxStore.ts';
 import { importFolder } from '../src/sync/importFolder.ts';
+import { ensureOutboxDirWritable } from '../src/sync/staging.ts';
 
 /**
- * Bulk-import a WhatsApp "Export chat (with media)" folder into Immich.
+ * Bulk-import a WhatsApp "Export chat (with media)" folder into the outbox.
  *
  * Use this for media that predates the bot's group membership (WhatsApp never
  * delivers pre-join history to a member). Export the chat WITH MEDIA from a
  * phone that has the photos, unzip it, then point this script at the folder.
+ *
+ * This only stages bytes and queues rows — it does not talk to Immich itself.
+ * Run the daemon (or its drain loop) afterwards to actually upload; that
+ * keeps this script's failure behaviour identical to the live and zip-backfill
+ * paths instead of rebuilding a third one.
  *
  * Usage:
  *   npx tsx scripts/import-export.ts <folder> [--album "Album Name"]
@@ -34,15 +41,19 @@ async function main(): Promise<void> {
   }
   statSync(folder); // throws if missing
 
-  const { immichUrl, immichApiKey } = loadImmichEnv();
   const albumName = pickAlbumName();
-  const immich = new ImmichClient({ baseUrl: immichUrl, apiKey: immichApiKey });
-  const dedup = new DedupStore(getDedupDb());
+  const outboxDir = getOutboxDir();
+  await ensureOutboxDirWritable(outboxDir);
+  const db = openDb(getDedupDb());
+  // DedupStore before OutboxStore: OutboxStore's constructor assumes the
+  // `synced` table (created by DedupStore) already exists on this connection.
+  const dedup = new DedupStore(db);
+  const outbox = new OutboxStore(db);
 
   logger.info({ folder, album: albumName || '(none)' }, 'import starting');
-  const stats = await importFolder(folder, { immich, dedup, albumName, logger });
+  const stats = await importFolder(folder, { outbox, dedup, outboxDir, albumName, logger });
   dedup.close();
-  logger.info(stats, 'import complete');
+  logger.info(stats, 'import queued; run the daemon to upload to Immich');
 }
 
 main().catch((err) => {

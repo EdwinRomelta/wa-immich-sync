@@ -1,6 +1,12 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import AdmZip from 'adm-zip';
 import type { WAMessage } from '@whiskeysockets/baileys';
+import { openDb } from '../src/sync/db.ts';
+import { DedupStore } from '../src/sync/dedupStore.ts';
+import { OutboxStore } from '../src/sync/outboxStore.ts';
 import { handleBackfillMessage } from '../src/sync/backfillIngest.ts';
 
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
@@ -12,13 +18,11 @@ function zipWith(files: Record<string, Buffer>): Buffer {
 }
 
 function makeDeps(overrides: Partial<Record<string, unknown>> = {}) {
-  const immich = {
-    uploadAsset: vi.fn(async () => ({ assetId: 'a1', status: 'created' as const })),
-    ensureAlbum: vi.fn(async () => 'album1'),
-    addToAlbum: vi.fn(async () => {}),
-  };
-  const dedup = { has: vi.fn(() => false), markDone: vi.fn() };
-  return { immich, dedup, logger, defaultAlbum: 'Default', ...overrides };
+  const db = openDb(':memory:');
+  const dedup = new DedupStore(db);
+  const outbox = new OutboxStore(db);
+  const outboxDir = mkdtempSync(join(tmpdir(), 'backfill-outbox-'));
+  return { outbox, dedup, outboxDir, logger, defaultAlbum: 'Default', ...overrides };
 }
 
 const zipMsg = (caption?: string): WAMessage =>
@@ -33,10 +37,10 @@ describe('handleBackfillMessage', () => {
     const m = { key: { remoteJid: 'backfill@g.us' }, message: { conversation: 'hi' } } as WAMessage;
     const sock = { updateMediaMessage: vi.fn(), sendMessage: vi.fn() } as never;
     expect(await handleBackfillMessage(sock, m, deps as never)).toBe(false);
-    expect(deps.immich.uploadAsset).not.toHaveBeenCalled();
+    expect(deps.outbox.due(Date.now(), 10)).toHaveLength(0);
   });
 
-  it('unzips a zip and imports its media, using the caption as album name', async () => {
+  it('unzips a zip and queues its media via the outbox, using the caption as album name', async () => {
     const buffer = zipWith({ 'IMG-20240101-WA0001.jpg': Buffer.from([1, 2, 3]) });
     const deps = makeDeps({ download: vi.fn(async () => buffer) });
     const sendMessage = vi.fn(async () => {});
@@ -45,13 +49,16 @@ describe('handleBackfillMessage', () => {
     const handled = await handleBackfillMessage(sock, zipMsg('My Album'), deps as never);
 
     expect(handled).toBe(true);
-    expect(deps.immich.uploadAsset).toHaveBeenCalledTimes(1);
-    expect(deps.immich.ensureAlbum).toHaveBeenCalledWith('My Album');
+    const rows = deps.outbox.due(Date.now(), 10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.albumName).toBe('My Album');
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const calls = sendMessage.mock.calls as unknown as Array<[string, { text: string }]>;
     const reply = calls[0][1].text;
     expect(reply).toContain('My Album');
-    expect(reply).toContain('uploaded: 1');
+    expect(reply).toContain('queued: 1');
+    // Must not claim the media is already in Immich — it is only queued.
+    expect(reply).not.toContain('uploaded:');
   });
 
   it('falls back to the default album when there is no caption', async () => {
@@ -60,6 +67,27 @@ describe('handleBackfillMessage', () => {
     const sock = { updateMediaMessage: vi.fn(), sendMessage: vi.fn(async () => {}) } as never;
 
     await handleBackfillMessage(sock, zipMsg(), deps as never);
-    expect(deps.immich.ensureAlbum).toHaveBeenCalledWith('Default');
+    const rows = deps.outbox.due(Date.now(), 10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.albumName).toBe('Default');
+  });
+
+  it('does not re-queue a file whose content is already in the outbox or synced', async () => {
+    const buffer = zipWith({ 'IMG-20240101-WA0003.jpg': Buffer.from([7, 8, 9]) });
+    const deps = makeDeps({ download: vi.fn(async () => buffer) });
+    const sock = { updateMediaMessage: vi.fn(), sendMessage: vi.fn(async () => {}) } as never;
+
+    await handleBackfillMessage(sock, zipMsg('First'), deps as never);
+    expect(deps.outbox.due(Date.now(), 10)).toHaveLength(1);
+
+    const sendMessage2 = vi.fn(async () => {});
+    const sock2 = { updateMediaMessage: vi.fn(), sendMessage: sendMessage2 } as never;
+    await handleBackfillMessage(sock2, zipMsg('Second'), deps as never);
+
+    // Still only the one row from the first import — the second run's file
+    // has identical content and must be skipped as a dedup, not re-queued.
+    expect(deps.outbox.due(Date.now(), 10)).toHaveLength(1);
+    const calls = sendMessage2.mock.calls as unknown as Array<[string, { text: string }]>;
+    expect(calls[0][1].text).toContain('already-synced: 1');
   });
 });
