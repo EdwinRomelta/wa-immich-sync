@@ -1,20 +1,42 @@
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { WAMessage } from '@whiskeysockets/baileys';
-import { getDedupDb, getWaAuthDir, loadConfig, loadImmichEnv } from './config.ts';
+import { getDedupDb, getDrainSettings, getOutboxDir, getWaAuthDir, loadConfig, loadImmichEnv } from './config.ts';
 import { logger } from './logger.ts';
 import { ImmichClient } from './immich/client.ts';
+import { openDb } from './sync/db.ts';
 import { DedupStore } from './sync/dedupStore.ts';
-import { createPipeline } from './sync/pipeline.ts';
+import { OutboxStore } from './sync/outboxStore.ts';
+import { createIngest } from './sync/ingest.ts';
+import { startDrain } from './sync/drain.ts';
+import { sweepOrphans } from './sync/staging.ts';
 import { OldestAnchors, startBackfill } from './sync/backfill.ts';
 import { handleBackfillMessage } from './sync/backfillIngest.ts';
 import { resolveWhitelist } from './wa/groupResolver.ts';
 import { startWaClient } from './wa/client.ts';
-import { withRetry } from './util/retry.ts';
 import { createGate } from './util/gate.ts';
 
 /** WhatsApp message timestamp (seconds), tolerant of number | Long | undefined. */
 function tsSecOf(m: WAMessage): number {
   const raw = m.messageTimestamp;
   return typeof raw === 'number' ? raw : Number(raw ?? 0);
+}
+
+/**
+ * Create the outbox staging directory and confirm it is actually writable.
+ *
+ * Without this, a misconfigured OUTBOX_DIR (bad permissions, a bind mount not
+ * ready yet, a typo'd path) makes ingest fail silently and repeatedly: every
+ * single WhatsApp message returns 'error' forever, one log line at a time,
+ * while traffic streams past unrecorded. This is the one startup check that
+ * SHOULD block — unlike the Immich readiness gate removed below, there is no
+ * safe way to proceed without a writable place to put bytes.
+ */
+async function ensureOutboxDirWritable(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  const probePath = join(dir, '.write-probe');
+  await writeFile(probePath, '');
+  await rm(probePath, { force: true });
 }
 
 async function main(): Promise<void> {
@@ -33,22 +55,30 @@ async function main(): Promise<void> {
 
   const immich = new ImmichClient({ baseUrl: immichUrl, apiKey: immichApiKey });
 
-  // At host boot this container and Immich start in the same second, and
-  // WhatsApp's offline replay (`append`) fires within seconds of connecting —
-  // long before Immich finishes booting. Uploads then die on ECONNREFUSED and
-  // that replay window is gone for good (2026-07-08 photos were lost this way).
-  // Hold the WhatsApp connect until Immich actually answers.
-  await withRetry(() => immich.ping(), {
-    retries: 120,
-    baseDelayMs: 1000,
-    maxDelayMs: 10_000,
-    onRetry: (err, attempt) =>
-      logger.warn({ attempt, err: (err as Error).message }, 'waiting for Immich to come up'),
-  });
-  logger.info('Immich reachable');
+  // No Immich readiness gate: ingest stages media to disk regardless of
+  // whether Immich is reachable, and drain retries with backoff until it
+  // answers. Blocking startup on `immich.ping()` used to abort the whole
+  // process after ~20 minutes of Immich downtime — a crash mode that only
+  // existed because an in-flight message had nowhere safe to go. With the
+  // outbox it does, so WhatsApp connects immediately regardless of Immich.
+  const outboxDir = getOutboxDir();
+  await ensureOutboxDirWritable(outboxDir);
 
-  const dedup = new DedupStore(getDedupDb());
-  const pipeline = createPipeline({ config, immich, dedup, logger, extractDeps: { logger } });
+  const db = openDb(getDedupDb());
+  // DedupStore must be constructed before OutboxStore on this shared
+  // connection: OutboxStore.markSyncedAndRemove writes to the `synced` table
+  // that DedupStore's constructor creates.
+  const dedup = new DedupStore(db);
+  const outbox = new OutboxStore(db);
+
+  // A crash between staging a file and inserting its row leaves an orphan.
+  const swept = await sweepOrphans(outboxDir, outbox.allFilePaths());
+  if (swept > 0) logger.info({ swept }, 'outbox: removed orphaned staged files');
+
+  const ingest = createIngest({ config, dedup, outbox, outboxDir, logger, extractDeps: { logger } });
+  const drainSettings = getDrainSettings();
+  const drain = startDrain({ immich, outbox, logger, ...drainSettings });
+  logger.info({ ...drainSettings, outboxDir, pending: outbox.depth() }, 'drain started');
 
   // Backfill cursor: oldest seen message per whitelisted group, fed by both
   // history and live messages, paged backwards via fetchMessageHistory. The
@@ -110,8 +140,8 @@ async function main(): Promise<void> {
 
       noteAnchor(m);
       try {
-        const outcome = await pipeline.process(sock, m);
-        if (outcome === 'uploaded') logger.info({ jid }, 'live upload');
+        const outcome = await ingest.ingest(sock, m);
+        if (outcome === 'queued') logger.info({ jid }, 'live queued');
       } catch (err) {
         logger.warn({ err: (err as Error).message }, 'live process threw');
       }
@@ -123,7 +153,7 @@ async function main(): Promise<void> {
           for (const m of messages) {
             noteAnchor(m);
             try {
-              const o = await pipeline.process(sock, m);
+              const o = await ingest.ingest(sock, m);
               batchTally[o] = (batchTally[o] ?? 0) + 1;
             } catch (err) {
               batchTally.throw = (batchTally.throw ?? 0) + 1;
@@ -143,7 +173,7 @@ async function main(): Promise<void> {
         // Whitelist (names or jids) → concrete groups.
         const { resolved, warnings } = resolveWhitelist(groups, config.whitelist);
         for (const w of warnings) logger.warn({ warning: w }, 'whitelist');
-        pipeline.setGroups(resolved);
+        ingest.setGroups(resolved);
         whitelistJids.clear();
         for (const g of resolved) whitelistJids.add(g.jid);
         if (resolved[0]) backfillDefaultAlbum = resolved[0].name;
@@ -191,13 +221,26 @@ async function main(): Promise<void> {
     },
   });
 
-  const shutdown = () => {
+  // Re-entrancy guard: a second SIGTERM/SIGINT arriving while shutdown is
+  // already in flight must not race a second drain.stop()/dedup.close() pair
+  // against the first. The flag is set synchronously before the first
+  // `await`, so a signal that arrives after that point sees it immediately.
+  let shuttingDown = false;
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info('shutting down');
+    // Must be awaited: drain.stop() waits for any in-flight tick to finish
+    // before returning. Closing the shared sqlite handle underneath a live
+    // markSyncedAndRemove/defer call throws inside a timer callback and would
+    // exit the container with code 1 instead of 0 — docker-compose.yml sets
+    // `init: true` specifically so this handler can close sqlite cleanly.
+    await drain.stop();
     dedup.close();
     process.exit(0);
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', () => void shutdown());
 }
 
 main().catch((err) => {
