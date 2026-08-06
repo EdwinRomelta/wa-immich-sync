@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { loadConfig } from '../src/config.ts';
+import { getDrainSettings, getOutboxDir, loadConfig } from '../src/config.ts';
 
 const KEYS = [
   'WHITELIST_GROUPS',
@@ -65,5 +65,71 @@ describe('loadConfig', () => {
     expect(c.albumMode).toBe('single');
     expect(c.singleAlbumName).toBe('All');
     expect(c.backfillGroupName).toBe('bf');
+  });
+});
+
+describe('outbox settings', () => {
+  it('defaults the outbox directory', () => {
+    delete process.env.OUTBOX_DIR;
+    expect(getOutboxDir()).toBe('./data/outbox');
+  });
+
+  it('honours OUTBOX_DIR when set', () => {
+    process.env.OUTBOX_DIR = '/mnt/staging';
+    expect(getOutboxDir()).toBe('/mnt/staging');
+    delete process.env.OUTBOX_DIR;
+  });
+
+  it('uses the documented drain defaults', () => {
+    for (const k of [
+      'DRAIN_INTERVAL_MS',
+      'DRAIN_BATCH_SIZE',
+      'DRAIN_BASE_BACKOFF_MS',
+      'DRAIN_MAX_BACKOFF_MS',
+      'DRAIN_DROP_AFTER_ATTEMPTS',
+      'DRAIN_MAX_DROPS_PER_TICK',
+    ]) delete process.env[k];
+
+    expect(getDrainSettings()).toEqual({
+      intervalMs: 30_000,
+      batchSize: 10,
+      baseBackoffMs: 30_000,
+      maxBackoffMs: 3_600_000,
+      dropAfterAttempts: 3,
+      maxDropsPerTick: 5,
+    });
+  });
+
+  it('parses drain overrides from the environment', () => {
+    process.env.DRAIN_INTERVAL_MS = '5000';
+    process.env.DRAIN_BATCH_SIZE = '3';
+    expect(getDrainSettings().intervalMs).toBe(5000);
+    expect(getDrainSettings().batchSize).toBe(3);
+    delete process.env.DRAIN_INTERVAL_MS;
+    delete process.env.DRAIN_BATCH_SIZE;
+  });
+
+  it('falls back to the default when an override is not a positive number', () => {
+    process.env.DRAIN_BATCH_SIZE = 'not-a-number';
+    expect(getDrainSettings().batchSize).toBe(10);
+    delete process.env.DRAIN_BATCH_SIZE;
+  });
+
+  it('parses dropAfterAttempts and maxDropsPerTick overrides from the environment', () => {
+    process.env.DRAIN_DROP_AFTER_ATTEMPTS = '7';
+    process.env.DRAIN_MAX_DROPS_PER_TICK = '2';
+    expect(getDrainSettings().dropAfterAttempts).toBe(7);
+    expect(getDrainSettings().maxDropsPerTick).toBe(2);
+    delete process.env.DRAIN_DROP_AFTER_ATTEMPTS;
+    delete process.env.DRAIN_MAX_DROPS_PER_TICK;
+  });
+
+  it('falls back to the default when dropAfterAttempts/maxDropsPerTick are not positive numbers', () => {
+    process.env.DRAIN_DROP_AFTER_ATTEMPTS = '0';
+    process.env.DRAIN_MAX_DROPS_PER_TICK = '-1';
+    expect(getDrainSettings().dropAfterAttempts).toBe(3);
+    expect(getDrainSettings().maxDropsPerTick).toBe(5);
+    delete process.env.DRAIN_DROP_AFTER_ATTEMPTS;
+    delete process.env.DRAIN_MAX_DROPS_PER_TICK;
   });
 });

@@ -80,3 +80,39 @@ export function getDedupDb(): string {
   ensureDotenv();
   return process.env.DEDUP_DB ?? './data/synced.db';
 }
+
+/** Read a positive-integer env var, falling back to `dflt` when unset or invalid. */
+function intEnv(name: string, dflt: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt;
+}
+
+/** Directory where media is staged between WhatsApp capture and Immich upload. */
+export function getOutboxDir(): string {
+  ensureDotenv();
+  return process.env.OUTBOX_DIR ?? './data/outbox';
+}
+
+/** Drain loop tuning. Defaults per the Phase 1 design spec and `startDrain`'s own fallbacks. */
+export function getDrainSettings(): {
+  intervalMs: number;
+  batchSize: number;
+  baseBackoffMs: number;
+  maxBackoffMs: number;
+  /** Retries a stuck row earns before its staged file is treated as terminal (see startDrain). */
+  dropAfterAttempts: number;
+  /** Cap on terminal drops per tick, so a directory outage can't empty the queue. */
+  maxDropsPerTick: number;
+} {
+  ensureDotenv();
+  return {
+    intervalMs: intEnv('DRAIN_INTERVAL_MS', 30_000),
+    batchSize: intEnv('DRAIN_BATCH_SIZE', 10),
+    baseBackoffMs: intEnv('DRAIN_BASE_BACKOFF_MS', 30_000),
+    maxBackoffMs: intEnv('DRAIN_MAX_BACKOFF_MS', 3_600_000),
+    dropAfterAttempts: intEnv('DRAIN_DROP_AFTER_ATTEMPTS', 3),
+    maxDropsPerTick: intEnv('DRAIN_MAX_DROPS_PER_TICK', 5),
+  };
+}
