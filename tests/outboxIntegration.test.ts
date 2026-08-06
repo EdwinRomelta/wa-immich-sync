@@ -124,7 +124,7 @@ describe('regression: a daemon restart must not lose queued work', () => {
     const sock = { sendMessage: vi.fn(), updateMediaMessage: vi.fn() };
 
     // --- Before the outage: the daemon is running, captures a message. ---
-    await ensureOutboxDirWritable(stagingDir);
+    await ensureOutboxDirWritable(stagingDir, []);
     // A real on-disk sqlite file, not ':memory:' — :memory: is destroyed the
     // instant the connection closes and cannot demonstrate restart survival.
     const db1 = openDb(dbPath);

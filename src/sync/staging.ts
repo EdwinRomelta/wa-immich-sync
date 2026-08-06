@@ -120,6 +120,9 @@ async function syncDir(dir: string): Promise<void> {
   }
 }
 
+/** Entries `ensureOutboxDirWritable` recognises as its own, not foreign data. */
+const KNOWN_ENTRIES = new Set([OUTBOX_MARKER_FILE, 'tmp', '.write-probe']);
+
 /**
  * Create the outbox staging directory, confirm it is actually writable, and
  * mark it so `sweepOrphans` can recognise it as its own later.
@@ -135,18 +138,51 @@ async function syncDir(dir: string): Promise<void> {
  * startup sweep (the dedup db file, the WhatsApp auth dir) — see
  * `assertNoOverlap`. Callers pass these in rather than this module reading
  * them from config, so staging.ts stays free of env access and unit
- * testable.
+ * testable. `guards` is required (not defaulted to `[]`) so a call site can
+ * never silently omit it and turn `assertNoOverlap` into a no-op — that
+ * exact omission was previously caught in `scripts/import-export.ts`.
+ *
+ * Before planting the marker, refuse a directory that is non-empty and NOT
+ * already marked. This is the fix for a real production bug: this function
+ * used to write the marker unconditionally, and `src/index.ts` calls
+ * `sweepOrphans` on the same directory ten lines later — so the marker
+ * always existed by the time `sweepOrphans` ran, regardless of what else was
+ * in the directory. `sweepOrphans`'s own marker check (see its docstring)
+ * never got a chance to protect anything in production: it only looked
+ * independent in tests that call `sweepOrphans` directly, a call order that
+ * exists nowhere in the running daemon. Concretely, an `OUTBOX_DIR` pointed
+ * at any existing directory with unrelated files in it — a typo, a reused
+ * folder, a Docker volume aimed at the wrong host path — had every one of
+ * those files deleted on the very first boot. Refusing here, before the
+ * marker is ever written, makes the marker's promise ("only a directory this
+ * code prepared gets swept") actually true.
  */
-export async function ensureOutboxDirWritable(dir: string, guards: OverlapGuard[] = []): Promise<void> {
+export async function ensureOutboxDirWritable(dir: string, guards: OverlapGuard[]): Promise<void> {
   assertNoOverlap(dir, guards);
+  // mkdir must run before the readdir below: a directory that does not exist
+  // yet is the common "fresh OUTBOX_DIR" case and must be accepted, not
+  // mistaken for ENOENT-as-refusal.
   await mkdir(dir, { recursive: true });
+
+  const existing = await readdir(dir);
+  const alreadyMarked = existing.includes(OUTBOX_MARKER_FILE);
+  const foreign = existing.filter((e) => !KNOWN_ENTRIES.has(e));
+  if (foreign.length > 0 && !alreadyMarked) {
+    throw new Error(
+      `OUTBOX_DIR (${dir}) is not empty and was not created by wa-immich-sync ` +
+        `(found ${foreign.slice(0, 5).join(', ')}). The startup sweep deletes every ` +
+        'unreferenced file in this directory. Point OUTBOX_DIR at a dedicated empty directory.',
+    );
+  }
+
   const probePath = join(dir, '.write-probe');
   await writeFile(probePath, '');
   await rm(probePath, { force: true });
-  // Written last, once the directory is confirmed writable: its presence is
-  // what tells sweepOrphans (below) that this directory is a real outbox
-  // staging area and not some arbitrary non-empty directory OUTBOX_DIR was
-  // accidentally repointed at.
+  // Written last, once the directory is confirmed writable and (per the
+  // check above) either already ours or empty: its presence is what tells
+  // sweepOrphans (below) that this directory is a real outbox staging area
+  // and not some arbitrary non-empty directory OUTBOX_DIR was accidentally
+  // repointed at. Re-writing it when already present is a harmless no-op.
   await writeFile(join(dir, OUTBOX_MARKER_FILE), '');
 }
 
@@ -164,6 +200,14 @@ export async function ensureOutboxDirWritable(dir: string, guards: OverlapGuard[
  * merely non-empty (an unrelated folder, a mistake, a home directory) is
  * left alone instead of having its files deleted. An empty directory sweeps
  * fine without a marker — there's nothing there to protect yet.
+ *
+ * This check is only meaningful in production because `ensureOutboxDirWritable`
+ * now refuses to plant the marker into a non-empty, not-already-marked
+ * directory in the first place (see its docstring) — every real call to this
+ * function is preceded by that call, so by the time a directory reaches here
+ * it has already earned its marker honestly. Calling `sweepOrphans` directly
+ * on a directory `ensureOutboxDirWritable` never touched, as some tests do,
+ * is what exercises this function's own guard in isolation.
  */
 export async function sweepOrphans(dir: string, keep: string[]): Promise<number> {
   let entries;

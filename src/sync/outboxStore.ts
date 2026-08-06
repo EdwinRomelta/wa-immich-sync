@@ -153,4 +153,55 @@ export class OutboxStore {
     const rows = this.db.prepare('SELECT file_path FROM outbox').all() as { file_path: string }[];
     return rows.map((r) => r.file_path);
   }
+
+  /**
+   * Diagnostic snapshot for `npm run status`. The `synced` table only shows
+   * what has already reached Immich; with a drain stuck (bad API key, a
+   * poison row, Immich down) that count freezes and gives no signal whether
+   * 0 or 4,000 photos are sitting queued. This surfaces the outbox side of
+   * that picture from columns the table already has.
+   */
+  snapshot(now: number = Date.now()): OutboxSnapshot {
+    const depth = this.depth();
+    if (depth === 0) {
+      return { depth: 0, oldestPendingAgeMs: null, maxAttempts: 0, lastError: null };
+    }
+
+    const oldest = this.db
+      .prepare('SELECT created_at FROM outbox ORDER BY created_at ASC LIMIT 1')
+      .get() as { created_at: number };
+
+    const { m: maxAttempts } = this.db.prepare('SELECT MAX(attempts) AS m FROM outbox').get() as {
+      m: number | null;
+    };
+
+    // There is no separate "last attempted at" column, so next_try_at is
+    // used as the recency proxy: defer() always sets it to `now + backoff`
+    // at the moment of the most recent failure, so the row with the highest
+    // next_try_at is the one that failed most recently.
+    const lastErrorRow = this.db
+      .prepare(
+        `SELECT last_error FROM outbox WHERE last_error IS NOT NULL
+         ORDER BY next_try_at DESC LIMIT 1`,
+      )
+      .get() as { last_error: string } | undefined;
+
+    return {
+      depth,
+      oldestPendingAgeMs: Math.max(0, now - oldest.created_at),
+      maxAttempts: maxAttempts ?? 0,
+      lastError: lastErrorRow?.last_error ?? null,
+    };
+  }
+}
+
+/** Diagnostic summary of pending outbox work, see `OutboxStore.snapshot`. */
+export interface OutboxSnapshot {
+  depth: number;
+  /** Age in ms of the oldest still-pending row, or null when the outbox is empty. */
+  oldestPendingAgeMs: number | null;
+  /** Highest retry count across all pending rows (0 if none have ever failed). */
+  maxAttempts: number;
+  /** The last_error of the most recently deferred row, or null if none has failed yet. */
+  lastError: string | null;
 }

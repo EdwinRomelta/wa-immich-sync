@@ -38,8 +38,14 @@ export interface WaClientOptions {
   onMessage: (sock: WASocket, m: WAMessage) => Promise<void> | void;
   /** Called with each batch of synced history messages (messaging-history.set). */
   onHistory?: (sock: WASocket, messages: WAMessage[]) => Promise<void> | void;
-  /** Called once the connection opens. */
-  onReady?: (sock: WASocket) => void;
+  /**
+   * Called once the connection opens. May be async (src/index.ts's resolves
+   * groups and seeds the backfill cursor) — the call site awaits nothing, so
+   * a returned promise is handled the same way `tick()` is in drain.ts and
+   * src/index.ts: `void`'d with a `.catch`, not left to become an unhandled
+   * rejection.
+   */
+  onReady?: (sock: WASocket) => void | Promise<void>;
   /**
    * Consecutive failed connect attempts, used to space out reconnects.
    * Set internally when re-entering after a disconnect; callers pass nothing.
@@ -94,7 +100,17 @@ export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
     if (connection === 'open') {
       reconnectAttempt = 0;
       opts.logger.info('WhatsApp connection open');
-      opts.onReady?.(sock);
+      // This 'connection.update' handler is synchronous, and onReady's own
+      // internal try/catch (group resolution, in src/index.ts) does not
+      // cover everything it does afterwards — e.g. dedup.newestByGroup() is
+      // a synchronous better-sqlite3 call outside any try. An uncaught throw
+      // there would reject the promise onReady returns; left unhandled here,
+      // that becomes an unhandled promise rejection that kills the process
+      // under `restart: always` (docker-compose.yml). Same fix shape as
+      // drain's loop() wrapping tick(): void the call, catch and log.
+      void Promise.resolve(opts.onReady?.(sock)).catch((err) => {
+        opts.logger.error(err, 'onReady handler failed');
+      });
     }
 
     if (connection === 'close') {

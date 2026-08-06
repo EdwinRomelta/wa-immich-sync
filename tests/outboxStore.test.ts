@@ -149,4 +149,62 @@ describe('OutboxStore', () => {
     outbox.enqueue(make({ messageId: 'g@g.us:A2', filePath: '/tmp/outbox/two' }));
     expect(outbox.allFilePaths().sort()).toEqual(['/tmp/outbox/one', '/tmp/outbox/two']);
   });
+
+  describe('snapshot', () => {
+    it('reports an empty outbox with no pending work', () => {
+      const { outbox } = setup();
+      expect(outbox.snapshot(1_000)).toEqual({
+        depth: 0,
+        oldestPendingAgeMs: null,
+        maxAttempts: 0,
+        lastError: null,
+      });
+    });
+
+    it('reports depth and the oldest pending row age from the earliest created_at', () => {
+      const { outbox } = setup();
+      outbox.enqueue(make({ messageId: 'g@g.us:newer', createdAt: 5_000 }));
+      outbox.enqueue(make({ messageId: 'g@g.us:older', createdAt: 1_000 }));
+
+      const snap = outbox.snapshot(9_000);
+      expect(snap.depth).toBe(2);
+      expect(snap.oldestPendingAgeMs).toBe(8_000);
+    });
+
+    it('reports the highest attempts count across all pending rows', () => {
+      const { outbox } = setup();
+      outbox.enqueue(make({ messageId: 'g@g.us:A' }));
+      outbox.enqueue(make({ messageId: 'g@g.us:B' }));
+      outbox.defer('g@g.us:A', 'ECONNREFUSED', 1_000);
+      outbox.defer('g@g.us:B', 'ECONNREFUSED', 1_000);
+      outbox.defer('g@g.us:B', 'ECONNREFUSED', 2_000);
+
+      expect(outbox.snapshot(3_000).maxAttempts).toBe(2);
+    });
+
+    it('reports none as the most recent error before any row has ever failed', () => {
+      const { outbox } = setup();
+      outbox.enqueue(make());
+      expect(outbox.snapshot(1_000).lastError).toBeNull();
+    });
+
+    it('reports the last_error of the most recently deferred row', () => {
+      const { outbox } = setup();
+      outbox.enqueue(make({ messageId: 'g@g.us:A' }));
+      outbox.enqueue(make({ messageId: 'g@g.us:B' }));
+      // B is deferred to a later next_try_at than A, so it is the more
+      // recent failure even though A was enqueued first.
+      outbox.defer('g@g.us:A', 'stale error', 1_000);
+      outbox.defer('g@g.us:B', 'fresh error', 5_000);
+
+      expect(outbox.snapshot(9_000).lastError).toBe('fresh error');
+    });
+
+    it('defaults `now` to the current time when not provided', () => {
+      const { outbox } = setup();
+      outbox.enqueue(make({ createdAt: Date.now() - 10 }));
+      const snap = outbox.snapshot();
+      expect(snap.oldestPendingAgeMs).toBeGreaterThanOrEqual(0);
+    });
+  });
 });

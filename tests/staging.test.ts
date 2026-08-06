@@ -168,19 +168,19 @@ describe('sweepOrphans', () => {
 describe('ensureOutboxDirWritable', () => {
   it('creates a nested directory that does not exist yet', async () => {
     const dir = join(newDir(), 'nested', 'outbox');
-    await ensureOutboxDirWritable(dir);
+    await ensureOutboxDirWritable(dir, []);
     expect(existsSync(dir)).toBe(true);
   });
 
   it('leaves a marker file behind so sweepOrphans recognises the directory later', async () => {
     const dir = newDir();
-    await ensureOutboxDirWritable(dir);
+    await ensureOutboxDirWritable(dir, []);
     expect(existsSync(join(dir, OUTBOX_MARKER_FILE))).toBe(true);
   });
 
   it('does not leave the write probe behind', async () => {
     const dir = newDir();
-    await ensureOutboxDirWritable(dir);
+    await ensureOutboxDirWritable(dir, []);
     expect(existsSync(join(dir, '.write-probe'))).toBe(false);
   });
 
@@ -189,7 +189,7 @@ describe('ensureOutboxDirWritable', () => {
     chmodSync(parent, 0o555);
     readOnlyDirs.push(parent);
 
-    await expect(ensureOutboxDirWritable(join(parent, 'outbox'))).rejects.toThrow();
+    await expect(ensureOutboxDirWritable(join(parent, 'outbox'), [])).rejects.toThrow();
   });
 
   it('rejects a staging dir that is the same as a guarded directory', async () => {
@@ -269,5 +269,92 @@ describe('ensureOutboxDirWritable', () => {
     await expect(
       ensureOutboxDirWritable(stagingDir, [{ label: 'WA_AUTH_DIR', path: authDir }]),
     ).resolves.toBeUndefined();
+  });
+
+  // BLOCKER regression: ensureOutboxDirWritable used to plant the marker
+  // unconditionally, so sweepOrphans's marker guard never protected anything
+  // in production — src/index.ts calls sweepOrphans on the very same
+  // directory ten lines after ensureOutboxDirWritable, by which point the
+  // marker always already existed. These tests exercise the guard this
+  // function itself must now apply, independent of sweepOrphans.
+  describe('refuses to adopt a populated directory it did not prepare', () => {
+    it('accepts an empty directory', async () => {
+      const dir = newDir();
+      await expect(ensureOutboxDirWritable(dir, [])).resolves.toBeUndefined();
+      expect(existsSync(join(dir, OUTBOX_MARKER_FILE))).toBe(true);
+    });
+
+    it('accepts an already-marked directory with staged files present', async () => {
+      const dir = newDir();
+      markDir(dir);
+      const staged = join(dir, 'g@g.us_A1-deadbeef');
+      writeFileSync(staged, 'irreplaceable-photo');
+
+      await expect(ensureOutboxDirWritable(dir, [])).resolves.toBeUndefined();
+      expect(existsSync(staged)).toBe(true);
+      expect(readFileSync(staged).toString()).toBe('irreplaceable-photo');
+    });
+
+    it('refuses a populated directory with no marker, and deletes nothing', async () => {
+      const dir = newDir();
+      writeFileSync(join(dir, 'family-vacation.jpg'), 'photo bytes');
+      writeFileSync(join(dir, 'taxes-2025.pdf'), 'tax bytes');
+
+      await expect(ensureOutboxDirWritable(dir, [])).rejects.toThrow(
+        /not empty and was not created by wa-immich-sync/,
+      );
+
+      // Nothing was touched: no marker planted, no files deleted.
+      expect(existsSync(join(dir, 'family-vacation.jpg'))).toBe(true);
+      expect(existsSync(join(dir, 'taxes-2025.pdf'))).toBe(true);
+      expect(existsSync(join(dir, OUTBOX_MARKER_FILE))).toBe(false);
+    });
+
+    it('names the offending files in the error message', async () => {
+      const dir = newDir();
+      writeFileSync(join(dir, 'grandmas-recipes.docx'), 'x');
+
+      await expect(ensureOutboxDirWritable(dir, [])).rejects.toThrow(/grandmas-recipes\.docx/);
+    });
+  });
+
+  // Verification gate 3: replay src/index.ts's exact startup call order
+  // (ensureOutboxDirWritable, then sweepOrphans on the same directory) against
+  // every real-world case that order must handle correctly.
+  describe('production call order: ensureOutboxDirWritable then sweepOrphans', () => {
+    it('a directory populated with unrelated data is refused before any delete happens', async () => {
+      const dir = newDir();
+      const before = ['family-vacation.jpg', 'taxes-2025.pdf'];
+      for (const name of before) writeFileSync(join(dir, name), 'irreplaceable bytes');
+
+      await expect(ensureOutboxDirWritable(dir, [])).rejects.toThrow();
+
+      // sweepOrphans is never reached in production once ensureOutboxDirWritable
+      // throws (src/index.ts awaits it first) — confirm the files are intact
+      // regardless.
+      expect(readdirSync(dir).sort()).toEqual(before.sort());
+    });
+
+    it('a fresh directory works end to end: prepared, then swept clean', async () => {
+      const dir = join(newDir(), 'fresh-outbox');
+      await ensureOutboxDirWritable(dir, []);
+      const swept = await sweepOrphans(dir, []);
+      expect(swept).toBe(0);
+      expect(existsSync(join(dir, OUTBOX_MARKER_FILE))).toBe(true);
+    });
+
+    it('a restart with staged files still present leaves them alone', async () => {
+      const dir = newDir();
+      const keep = await stageFile(dir, 'g@g.us:KEEP', Buffer.from('irreplaceable-photo'));
+      markDir(dir); // simulates the directory having survived a previous boot
+
+      // Same call order as every daemon restart in src/index.ts.
+      await ensureOutboxDirWritable(dir, []);
+      const swept = await sweepOrphans(dir, [keep]);
+
+      expect(swept).toBe(0);
+      expect(existsSync(keep)).toBe(true);
+      expect(readFileSync(keep).toString()).toBe('irreplaceable-photo');
+    });
   });
 });
