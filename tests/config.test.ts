@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { getDedupDb, getDrainSettings, getOutboxDir, getWaAuthDir, loadConfig, outboxGuards } from '../src/config.ts';
+import { getDedupDb, getDrainSettings, getHealthFile, getOutboxDir, getWaAuthDir, loadConfig, outboxGuards } from '../src/config.ts';
 
 const KEYS = [
   'WHITELIST_GROUPS',
@@ -144,15 +144,17 @@ describe('outbox settings', () => {
     delete process.env.DRAIN_MAX_DROPS_PER_TICK;
   });
 
-  it('names both the dedup db and the WA auth dir, so every ensureOutboxDirWritable caller guards the same paths', () => {
+  it('names the dedup db, the WA auth dir, and the health file, so every ensureOutboxDirWritable caller guards the same paths', () => {
     // src/index.ts and scripts/import-export.ts both call
     // ensureOutboxDirWritable(outboxDir, outboxGuards()); if this list ever
     // drops a path, the overlap check silently stops protecting it at BOTH
-    // call sites at once.
+    // call sites at once. Changing the list is a schema change: you must update
+    // this expectation and all call sites.
     const guards = outboxGuards();
     expect(guards).toEqual([
       { label: 'DEDUP_DB', path: getDedupDb() },
       { label: 'WA_AUTH_DIR', path: getWaAuthDir() },
+      { label: 'HEALTH_FILE', path: getHealthFile() },
     ]);
   });
 });
