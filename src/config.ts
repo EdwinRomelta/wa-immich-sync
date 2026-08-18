@@ -131,6 +131,16 @@ export function getAlertSettings(): {
 }
 
 /**
+ * How often the health monitor stamps the heartbeat and checks the outbox.
+ * Must be comfortably below HEALTH_STALE_MS, or a healthy daemon looks stale
+ * between ticks.
+ */
+export function getHealthMonitorSettings(): { intervalMs: number } {
+  ensureDotenv();
+  return { intervalMs: intEnv('HEALTH_INTERVAL_MS', 60_000) };
+}
+
+/**
  * Paths `ensureOutboxDirWritable`'s overlap guard must never let OUTBOX_DIR
  * reach: the dedup db file, the WhatsApp auth dir, and the health file. Every
  * caller of `ensureOutboxDirWritable` MUST pass this list — a caller that
