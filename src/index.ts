@@ -193,6 +193,12 @@ async function main(): Promise<void> {
     authDir: getWaAuthDir(),
     syncFullHistory: config.backfill,
     logger,
+    // Stamps `wa` from the raw frame stream (keepalives included), so the
+    // healthcheck tracks link liveness rather than chat traffic. onMessage
+    // and onReady below still stamp it too — harmless, and it means a fresh
+    // message or connection-open counts immediately rather than waiting for
+    // the next keepalive.
+    onFrame: noteWaActivity,
     onMessage: async (sock, m) => {
       noteWaActivity();
       await whitelistGate.wait();
@@ -300,13 +306,18 @@ async function main(): Promise<void> {
         });
         for (const gap of gaps) {
           logger.warn({ ...gap }, 'gap detected');
-          // Keyed per group so one quiet group cannot cool down the alert for
-          // every other group.
-          await alerter.raise(
-            `gap:${gap.groupJid}`,
-            `wa-immich-sync: ${describeGap(gap)}. If the daemon was down, that window ` +
-              'is not recovered automatically — re-import a chat export to fill it.',
-          );
+          // void + .catch, not await: raise() can hang on a half-open
+          // WhatsApp socket, and awaiting it here would stall onReady for
+          // this connection generation — backfill anchor seeding and pump
+          // start below would never run. Keyed per group so one quiet group
+          // cannot cool down the alert for every other group.
+          void alerter
+            .raise(
+              `gap:${gap.groupJid}`,
+              `wa-immich-sync: ${describeGap(gap)}. If the daemon was down, that window ` +
+                'is not recovered automatically — re-import a chat export to fill it.',
+            )
+            .catch((err) => logger.warn({ err: (err as Error).message }, 'gap alert threw'));
         }
       } catch (err) {
         logger.warn({ err: (err as Error).message }, 'gap detection failed');

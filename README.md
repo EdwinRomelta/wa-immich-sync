@@ -54,10 +54,15 @@ about the daemon not running — an outage on 2026-07-29 went unnoticed for six
 days. Three signals cover that:
 
 - **Docker healthcheck.** The daemon rewrites `HEALTH_FILE` every
-  `HEALTH_INTERVAL_MS`; the container is marked `unhealthy` once that stamp is
-  older than `HEALTH_STALE_MS`. Check it with `docker ps` or run it by hand with
-  `npm run healthcheck`. It reports liveness only — **an unreachable Immich is
-  deliberately not unhealthy**, because media still queues durably to disk.
+  `HEALTH_INTERVAL_MS` with two stamps: `daemon` (proves the event loop is
+  alive) and `wa` (proves the WhatsApp link is alive, driven by inbound
+  WebSocket frames — keepalives included, roughly every 30s — not just chat
+  messages, so a whitelisted group being quiet overnight does not by itself
+  make the container unhealthy). The container is marked `unhealthy` once
+  *either* stamp is older than `HEALTH_STALE_MS`. Check it with `docker ps` or
+  run it by hand with `npm run healthcheck`. It reports liveness only — **an
+  unreachable Immich is deliberately not unhealthy**, because media still
+  queues durably to disk.
 - **WhatsApp alerts.** The bot messages `ALERT_TARGET_JID` (its own number by
   default) when the outbox passes `ALERT_OUTBOX_DEPTH` or `ALERT_OUTBOX_AGE_MS`,
   when a whitelisted group has been silent longer than

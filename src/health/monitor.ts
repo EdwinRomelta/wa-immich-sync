@@ -60,27 +60,49 @@ export function startHealthMonitor(deps: HealthMonitorDeps): HealthMonitor {
       const snapshot = deps.outbox.snapshot(at);
 
       if (snapshot.depth >= deps.thresholds.outboxDepth) {
-        await deps.alerter.raise(
-          'outbox-depth',
-          `wa-immich-sync: ${snapshot.depth} items queued and not yet in Immich ` +
-            `(threshold ${deps.thresholds.outboxDepth}). Nothing is lost — they retry with backoff — ` +
-            `but Immich has not been accepting uploads. Last error: ${snapshot.lastError ?? 'none'}`,
-        );
+        // void + .catch, not await: raise() calls sock.sendMessage, which can
+        // hang forever on a half-open WhatsApp socket (the stall watchdog in
+        // src/wa/client.ts exists precisely because that happens). Awaiting
+        // it here would mean tick() never resolves, which means loop()'s
+        // .finally() never re-arms the timer — the heartbeat stops for good,
+        // not just for one cycle. raise() is contractually non-throwing; the
+        // .catch is defense-in-depth, matching every other call site of it.
+        void deps.alerter
+          .raise(
+            'outbox-depth',
+            `wa-immich-sync: ${snapshot.depth} items queued and not yet in Immich ` +
+              `(threshold ${deps.thresholds.outboxDepth}). Nothing is lost — they retry with backoff — ` +
+              `but Immich has not been accepting uploads. Last error: ${snapshot.lastError ?? 'none'}`,
+          )
+          .catch((err) => {
+            deps.logger.warn(
+              { err: err instanceof Error ? err.message : String(err) },
+              'health: outbox-depth alert threw',
+            );
+          });
       }
 
       const ageMs = snapshot.oldestPendingAgeMs;
       if (ageMs !== null && ageMs >= deps.thresholds.outboxAgeMs) {
-        await deps.alerter.raise(
-          'outbox-age',
-          `wa-immich-sync: oldest queued item is ${Math.round(ageMs / 3_600_000)}h old ` +
-            `(${snapshot.depth} queued, ${snapshot.maxAttempts} attempts). ` +
-            `Last error: ${snapshot.lastError ?? 'none'}`,
-        );
+        void deps.alerter
+          .raise(
+            'outbox-age',
+            `wa-immich-sync: oldest queued item is ${Math.round(ageMs / 3_600_000)}h old ` +
+              `(${snapshot.depth} queued, ${snapshot.maxAttempts} attempts). ` +
+              `Last error: ${snapshot.lastError ?? 'none'}`,
+          )
+          .catch((err) => {
+            deps.logger.warn(
+              { err: err instanceof Error ? err.message : String(err) },
+              'health: outbox-age alert threw',
+            );
+          });
       }
     } catch (err) {
-      // better-sqlite3 is synchronous, so snapshot() throws in-band; the
-      // alerter is async but documented never to throw. Contain both here so
-      // the timer loop below always re-arms.
+      // better-sqlite3 is synchronous, so snapshot() throws in-band; caught
+      // here so the timer loop below always re-arms. The alerter calls above
+      // are void'd + .catch'd rather than awaited, so a hung raise() cannot
+      // reach this catch (or block this tick) either — see the comment above.
       deps.logger.error(
         { err: err instanceof Error ? err.message : String(err) },
         'health: monitor tick failed',
