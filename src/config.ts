@@ -108,6 +108,28 @@ export function getHealthSettings(): { staleMs: number } {
   return { staleMs: intEnv('HEALTH_STALE_MS', 3_600_000) };
 }
 
+/** Alerting thresholds and cooldown. Defaults per the Phase 2 design spec. */
+export function getAlertSettings(): {
+  cooldownMs: number;
+  /** ALERT_TARGET_JID; undefined means "the bot's own number". */
+  targetJid?: string;
+  outboxDepth: number;
+  outboxAgeMs: number;
+  reconnectFailures: number;
+  /** Per-group silence before a gap is reported. */
+  gapThresholdMs: number;
+} {
+  ensureDotenv();
+  return {
+    cooldownMs: intEnv('ALERT_COOLDOWN_MS', 21_600_000),
+    targetJid: process.env.ALERT_TARGET_JID?.trim() || undefined,
+    outboxDepth: intEnv('ALERT_OUTBOX_DEPTH', 50),
+    outboxAgeMs: intEnv('ALERT_OUTBOX_AGE_MS', 7_200_000),
+    reconnectFailures: intEnv('ALERT_RECONNECT_FAILURES', 10),
+    gapThresholdMs: intEnv('CATCHUP_GAP_THRESHOLD_MS', 3_600_000),
+  };
+}
+
 /**
  * Paths `ensureOutboxDirWritable`'s overlap guard must never let OUTBOX_DIR
  * reach: the dedup db file, the WhatsApp auth dir, and the health file. Every
