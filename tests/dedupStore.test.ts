@@ -46,4 +46,44 @@ describe('DedupStore', () => {
     const row = db.prepare('SELECT COUNT(*) AS c FROM synced').get() as { c: number };
     expect(row.c).toBe(1);
   });
+
+  it('adds captured_at to a pre-existing synced table without losing rows', () => {
+    const db = openDb(':memory:');
+    // Simulate a database created before this migration existed.
+    db.exec(`
+      CREATE TABLE synced (
+        message_id      TEXT PRIMARY KEY,
+        group_jid       TEXT NOT NULL,
+        immich_asset_id TEXT,
+        status          TEXT NOT NULL,
+        created_at      INTEGER NOT NULL
+      )
+    `);
+    db.prepare(
+      `INSERT INTO synced (message_id, group_jid, immich_asset_id, status, created_at)
+       VALUES ('g@g.us:OLD', 'g@g.us', 'asset-old', 'created', 1000)`,
+    ).run();
+
+    const store = new DedupStore(db);
+
+    const cols = db.prepare('PRAGMA table_info(synced)').all() as { name: string }[];
+    expect(cols.some((c) => c.name === 'captured_at')).toBe(true);
+    expect(store.has('g@g.us:OLD')).toBe(true);
+    const old = db.prepare('SELECT captured_at FROM synced WHERE message_id = ?').get('g@g.us:OLD');
+    expect(old).toEqual({ captured_at: null });
+  });
+
+  it('is idempotent when captured_at already exists', () => {
+    const db = openDb(':memory:');
+    new DedupStore(db);
+    expect(() => new DedupStore(db)).not.toThrow();
+  });
+
+  it('records captured_at when markDone is given one', () => {
+    const db = openDb(':memory:');
+    const store = new DedupStore(db);
+    store.markDone('g@g.us:A1', 'g@g.us', 'asset-1', 'created', 1_700_000_000_000);
+    const row = db.prepare('SELECT captured_at FROM synced WHERE message_id = ?').get('g@g.us:A1');
+    expect(row).toEqual({ captured_at: 1_700_000_000_000 });
+  });
 });

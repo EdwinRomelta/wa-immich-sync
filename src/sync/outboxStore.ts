@@ -118,10 +118,11 @@ export class OutboxStore {
     const tx = this.db.transaction(() => {
       this.db
         .prepare(
-          `INSERT OR REPLACE INTO synced (message_id, group_jid, immich_asset_id, status, created_at)
-           VALUES (?, ?, ?, ?, ?)`,
+          `INSERT OR REPLACE INTO synced
+             (message_id, group_jid, immich_asset_id, status, created_at, captured_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(row.messageId, row.groupJid, assetId, status, Date.now());
+        .run(row.messageId, row.groupJid, assetId, status, Date.now(), row.capturedAt);
       this.db.prepare('DELETE FROM outbox WHERE message_id = ?').run(row.messageId);
     });
     tx();

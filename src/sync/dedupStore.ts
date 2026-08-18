@@ -25,19 +25,42 @@ export class DedupStore {
         created_at      INTEGER NOT NULL
       )
     `);
+    // Additive, idempotent migration. `created_at` records when a row was
+    // *synced*; gap detection needs when the message was *sent*, and the two
+    // diverge sharply for zip-imported and backfilled rows. Pre-existing rows
+    // stay NULL and fall back to created_at at query time (see gapDetect.ts).
+    // PRAGMA-then-ALTER rather than a caught "duplicate column" error: this
+    // runs on every boot, and swallowing SqliteError here would also swallow
+    // a genuinely broken schema.
+    const columns = this.db.prepare('PRAGMA table_info(synced)').all() as { name: string }[];
+    if (!columns.some((c) => c.name === 'captured_at')) {
+      this.db.exec('ALTER TABLE synced ADD COLUMN captured_at INTEGER');
+    }
   }
 
   has(messageId: string): boolean {
     return this.db.prepare('SELECT 1 FROM synced WHERE message_id = ?').get(messageId) !== undefined;
   }
 
-  markDone(messageId: string, groupJid: string, immichAssetId: string, status: string): void {
+  /**
+   * `capturedAt` is the WhatsApp send time. Optional because the column is
+   * nullable for rows written before the migration; pass it whenever it is
+   * known, or gap detection falls back to the (later, less accurate) sync time.
+   */
+  markDone(
+    messageId: string,
+    groupJid: string,
+    immichAssetId: string,
+    status: string,
+    capturedAt?: number,
+  ): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO synced (message_id, group_jid, immich_asset_id, status, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO synced
+           (message_id, group_jid, immich_asset_id, status, created_at, captured_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(messageId, groupJid, immichAssetId, status, Date.now());
+      .run(messageId, groupJid, immichAssetId, status, Date.now(), capturedAt ?? null);
   }
 
   count(): number {
