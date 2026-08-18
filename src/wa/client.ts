@@ -51,6 +51,13 @@ export interface WaClientOptions {
    * Set internally when re-entering after a disconnect; callers pass nothing.
    */
   reconnectAttempt?: number;
+  /**
+   * Called each time a reconnect is scheduled, with the 1-based consecutive
+   * attempt number. A link that keeps bouncing is the one WhatsApp-side fault
+   * the WhatsApp alert channel can still report — a link that is fully down
+   * cannot send anything, which is what the Docker healthcheck covers instead.
+   */
+  onReconnectScheduled?: (info: { attempt: number; delayMs: number; statusCode?: number }) => void;
 }
 
 /**
@@ -133,6 +140,17 @@ export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
         jitterRatio: RECONNECT_JITTER,
       });
       opts.logger.info({ attempt: nextAttempt, delayMs }, 'scheduling WhatsApp reconnect');
+      try {
+        opts.onReconnectScheduled?.({ attempt: nextAttempt, delayMs, statusCode });
+      } catch (err) {
+        // This handler is synchronous and inside Baileys' event emitter; a
+        // throw here would escape into the emitter and skip the reconnect
+        // scheduled below, turning an alerting failure into a dead link.
+        opts.logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'onReconnectScheduled threw',
+        );
+      }
       setTimeout(() => {
         startWaClient({ ...opts, reconnectAttempt: nextAttempt }).catch((err) =>
           opts.logger.error(err, 'reconnect failed'),
