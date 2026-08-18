@@ -60,36 +60,81 @@ export function createAlerter(deps: AlerterDeps): Alerter {
   const now = deps.now ?? Date.now;
 
   async function raise(condition: string, text: string): Promise<AlertOutcome> {
-    const at = now();
-
-    const last = deps.store.lastSentAt(condition);
-    if (last !== null && at - last < deps.cooldownMs) return 'cooldown';
-
-    const sock = deps.getSock();
-    const jid = deps.targetJid ?? selfJid(sock?.user?.id);
-    if (!sock || !jid) {
-      // Not an error: WhatsApp being down is itself one of the conditions
-      // worth alerting about, and the Docker healthcheck covers it. Crucially,
-      // no cooldown is recorded, so the alert still lands once the link is back.
-      deps.logger.warn({ condition }, 'alert not sent: no WhatsApp socket');
-      return 'no-socket';
-    }
-
     try {
-      await sock.sendMessage(jid, { text });
+      const at = now();
+
+      // Try to check cooldown, but if it fails, proceed anyway. A transient
+      // sqlite error (lock contention, I/O error) must not suppress the alert.
+      let last: number | null = null;
+      try {
+        last = deps.store.lastSentAt(condition);
+      } catch (err) {
+        deps.logger.warn(
+          { condition, err: err instanceof Error ? err.message : String(err) },
+          'alert: failed to read cooldown state; proceeding anyway',
+        );
+      }
+
+      if (last !== null && at - last < deps.cooldownMs) return 'cooldown';
+
+      // Try to get the socket, but catch errors to prevent unhandled rejection.
+      let sock: AlertSock | null;
+      try {
+        sock = deps.getSock();
+      } catch (err) {
+        deps.logger.warn(
+          { condition, err: err instanceof Error ? err.message : String(err) },
+          'alert: failed to get socket',
+        );
+        return 'no-socket';
+      }
+
+      const jid = deps.targetJid ?? selfJid(sock?.user?.id);
+      if (!sock || !jid) {
+        // Not an error: WhatsApp being down is itself one of the conditions
+        // worth alerting about, and the Docker healthcheck covers it. Crucially,
+        // no cooldown is recorded, so the alert still lands once the link is back.
+        deps.logger.warn({ condition }, 'alert not sent: no WhatsApp socket');
+        return 'no-socket';
+      }
+
+      try {
+        await sock.sendMessage(jid, { text });
+      } catch (err) {
+        // Also no cooldown recorded — a failed send must be retried on the next
+        // tick, not silently swallowed for the next six hours.
+        deps.logger.warn(
+          { condition, err: err instanceof Error ? err.message : String(err) },
+          'alert send failed',
+        );
+        return 'send-failed';
+      }
+
+      // Try to record sent. If this fails after a successful send, the message
+      // did reach the user; the lost cooldown marker will cause potential
+      // duplicate sends, but that is better than silencing the alert. Log the
+      // error and return 'sent' anyway.
+      try {
+        deps.store.recordSent(condition, at);
+      } catch (err) {
+        deps.logger.warn(
+          { condition, err: err instanceof Error ? err.message : String(err) },
+          'alert: failed to record cooldown after successful send',
+        );
+        // Still return 'sent' because the message did go out.
+      }
+
+      deps.logger.info({ condition }, 'alert sent');
+      return 'sent';
     } catch (err) {
-      // Also no cooldown recorded — a failed send must be retried on the next
-      // tick, not silently swallowed for the next six hours.
-      deps.logger.warn(
+      // Catch-all for any unexpected error not caught above (should not occur
+      // given the nested try/catch structure, but provides defense-in-depth).
+      deps.logger.error(
         { condition, err: err instanceof Error ? err.message : String(err) },
-        'alert send failed',
+        'alert: unexpected error',
       );
       return 'send-failed';
     }
-
-    deps.store.recordSent(condition, at);
-    deps.logger.info({ condition }, 'alert sent');
-    return 'sent';
   }
 
   return { raise };

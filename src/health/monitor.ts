@@ -90,9 +90,16 @@ export function startHealthMonitor(deps: HealthMonitorDeps): HealthMonitor {
 
   function loop(): void {
     if (stopped) return;
-    void tick().finally(() => {
-      if (!stopped) timer = setTimeout(loop, deps.intervalMs);
-    });
+    void tick()
+      .catch((err) => {
+        deps.logger.error(
+          { err: err instanceof Error ? err.message : String(err) },
+          'health: monitor tick rejected unexpectedly',
+        );
+      })
+      .finally(() => {
+        if (!stopped) timer = setTimeout(loop, deps.intervalMs);
+      });
   }
 
   function stop(): void {

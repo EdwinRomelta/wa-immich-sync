@@ -110,4 +110,54 @@ describe('createAlerter', () => {
     });
     expect(await alerter.raise('outbox-depth', 'queue deep')).toBe('no-socket');
   });
+
+  it('does not reject when lastSentAt throws', async () => {
+    const store = new AlertStore(openDb(':memory:'));
+    vi.spyOn(store, 'lastSentAt').mockImplementation(() => {
+      throw new Error('database is locked');
+    });
+    const alerter = createAlerter({
+      store,
+      getSock: () => ({ sendMessage: vi.fn(async () => ({})), user: { id: '628123456:12@s.whatsapp.net' } }),
+      cooldownMs: COOLDOWN,
+      logger: silentLogger(),
+      now: () => 1000,
+    });
+    // Should resolve to 'sent', not reject. Transient cooldown read failure
+    // must not suppress the alert.
+    await expect(alerter.raise('outbox-depth', 'msg')).resolves.toBe('sent');
+  });
+
+  it('does not reject when recordSent throws after successful send', async () => {
+    const store = new AlertStore(openDb(':memory:'));
+    vi.spyOn(store, 'recordSent').mockImplementation(() => {
+      throw new Error('database is locked');
+    });
+    const alerter = createAlerter({
+      store,
+      getSock: () => ({ sendMessage: vi.fn(async () => ({})), user: { id: '628123456:12@s.whatsapp.net' } }),
+      cooldownMs: COOLDOWN,
+      logger: silentLogger(),
+      now: () => 1000,
+    });
+    // Should resolve with 'sent' even though recordSent threw. The send
+    // succeeded (user saw the alert); the lost cooldown is a secondary concern.
+    await expect(alerter.raise('outbox-depth', 'msg')).resolves.toBe('sent');
+  });
+
+  it('does not reject when getSock throws', async () => {
+    const store = new AlertStore(openDb(':memory:'));
+    const alerter = createAlerter({
+      store,
+      getSock: () => {
+        throw new Error('unexpected error in getSock');
+      },
+      cooldownMs: COOLDOWN,
+      logger: silentLogger(),
+      now: () => 1000,
+    });
+    // Should resolve with 'no-socket', not reject. Even getSock errors are
+    // contained to prevent unhandled rejection.
+    await expect(alerter.raise('outbox-depth', 'msg')).resolves.toBe('no-socket');
+  });
 });
