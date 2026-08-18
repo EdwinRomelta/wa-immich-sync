@@ -1,10 +1,11 @@
 import { rm } from 'node:fs/promises';
 import type { WAMessage, WASocket } from '@whiskeysockets/baileys';
 import type { AppConfig, GroupConfig } from '../types.ts';
+import { withRetry } from '../util/retry.ts';
 import { extractMedia, type ExtractDeps } from '../wa/mediaExtractor.ts';
 import type { DedupStore } from './dedupStore.ts';
 import type { OutboxStore } from './outboxStore.ts';
-import { stageFile } from './staging.ts';
+import * as staging from './staging.ts';
 
 type IngestLogger = {
   info: (...a: unknown[]) => void;
@@ -23,6 +24,20 @@ export interface IngestDeps {
   /** Injectable extractor for tests. */
   extract?: typeof extractMedia;
   extractDeps?: ExtractDeps;
+  /**
+   * Extra attempts for the staging write. ENOSPC, EACCES on a not-yet-ready
+   * bind mount, and EBUSY are all commonly transient; a single attempt turned
+   * every one of them into permanent media loss. Defaults to 3.
+   */
+  stageRetries?: number;
+  /**
+   * Called when a message could not be captured at all — the bytes were
+   * downloaded but never reached disk or the queue, so nothing will retry and
+   * nothing will re-deliver it. This is the one loss the outbox cannot absorb,
+   * so it must be reported rather than logged and forgotten. Passed as a
+   * callback so ingest keeps knowing nothing about WhatsApp alerting.
+   */
+  onCaptureFailed?: (info: { messageId: string; groupJid: string; error: string }) => void;
 }
 
 export type IngestOutcome =
@@ -104,7 +119,24 @@ export function createIngest(deps: IngestDeps) {
     try {
       // Bytes to disk FIRST, row second. A crash between the two leaves an
       // orphan file (swept at startup), never a row without its media.
-      const filePath = await stageFile(deps.outboxDir, item.messageId, item.buffer);
+      //
+      // Retried, unlike the enqueue below: a staging write fails on ENOSPC,
+      // on a bind mount that is not ready yet, or on a transient EBUSY, and
+      // all three clear on their own. Before this, a single failure returned
+      // 'error' and the message was gone — no outbox row, so nothing retried
+      // it, and nothing re-delivers it either (live upserts carry only new
+      // traffic, and startBackfill pages away from it). The bytes are already
+      // in memory here, so retrying costs no bandwidth.
+      const filePath = await withRetry(() => staging.stageFile(deps.outboxDir, item.messageId, item.buffer), {
+        retries: deps.stageRetries ?? 3,
+        baseDelayMs: 500,
+        maxDelayMs: 5_000,
+        onRetry: (err, attempt) =>
+          deps.logger.warn(
+            { messageId: item.messageId, attempt, err: (err as Error).message },
+            'staging failed, retrying',
+          ),
+      });
       try {
         deps.outbox.enqueue({
           messageId: item.messageId,
@@ -119,7 +151,9 @@ export function createIngest(deps: IngestDeps) {
       } catch (err) {
         // The row never landed, so nothing will ever reference these bytes.
         // Drop them now rather than leaving an orphan for the startup sweep —
-        // this daemon is meant to run unattended for weeks.
+        // this daemon is meant to run unattended for weeks. Not retried: an
+        // enqueue failure is a schema or constraint fault, and repeating an
+        // identical INSERT cannot change the outcome.
         await rm(filePath, { force: true }).catch(() => {});
         throw err;
       }
@@ -130,6 +164,20 @@ export function createIngest(deps: IngestDeps) {
         { err, code: (err as NodeJS.ErrnoException).code },
         `ingest failed for ${item.messageId}`,
       );
+      // Report it: this is the one loss path the outbox cannot absorb.
+      try {
+        deps.onCaptureFailed?.({
+          messageId: item.messageId,
+          groupJid: item.groupJid,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } catch (notifyErr) {
+        // A broken notifier must not also swallow the outcome below.
+        deps.logger.warn(
+          { err: notifyErr instanceof Error ? notifyErr.message : String(notifyErr) },
+          'onCaptureFailed threw',
+        );
+      }
       return 'error';
     }
 

@@ -9,6 +9,11 @@ import { OutboxStore } from '../src/sync/outboxStore.ts';
 import { createIngest } from '../src/sync/ingest.ts';
 import type { AppConfig, MediaItem } from '../src/types.ts';
 
+vi.mock('../src/sync/staging.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/sync/staging.ts')>();
+  return { ...actual, stageFile: vi.fn(actual.stageFile) };
+});
+
 const GROUP = { jid: 'g@g.us', name: 'Daycare' };
 
 const config: AppConfig = {
@@ -34,7 +39,22 @@ const item = (id = 'A1'): MediaItem => ({
   buffer: Buffer.from('photo-bytes'),
 });
 
-function setup(overrides: Partial<AppConfig> = {}) {
+interface SetupOpts {
+  config?: Partial<AppConfig>;
+  stageRetries?: number;
+  onCaptureFailed?: (info: { messageId: string; groupJid: string; error: string }) => void;
+  /** Replaces the real OutboxStore, for forcing an enqueue failure. */
+  outboxOverride?: { has: (id: string) => boolean; enqueue: (item: never) => void };
+}
+
+function setup(opts: SetupOpts | Partial<AppConfig> = {}) {
+  // Keep the old call shape working: every existing test passes a bare
+  // Partial<AppConfig>, and none of them sets any SetupOpts key.
+  const o: SetupOpts =
+    'config' in opts || 'stageRetries' in opts || 'onCaptureFailed' in opts || 'outboxOverride' in opts
+      ? (opts as SetupOpts)
+      : { config: opts as Partial<AppConfig> };
+
   const db = openDb(':memory:');
   const dedup = new DedupStore(db);
   const outbox = new OutboxStore(db);
@@ -44,12 +64,14 @@ function setup(overrides: Partial<AppConfig> = {}) {
   const extract = vi.fn(async () => item());
 
   const ing = createIngest({
-    config: { ...config, ...overrides },
+    config: { ...config, ...o.config },
     dedup,
-    outbox,
+    outbox: (o.outboxOverride ?? outbox) as never,
     outboxDir: dir,
     logger,
     extract: extract as never,
+    stageRetries: o.stageRetries,
+    onCaptureFailed: o.onCaptureFailed,
   });
   ing.setGroups([GROUP]);
   return { ing, outbox, dedup, dir, logger, sock, extract };
@@ -202,5 +224,71 @@ describe('ingest', () => {
 
     expect(await ing.ingest(sock as never, msg())).toBe('error');
     expect(outbox.depth()).toBe(0);
+  });
+});
+
+describe('ingest staging failures', () => {
+  it('retries a transient staging failure and still queues the media', async () => {
+    const staging = await import('../src/sync/staging.ts');
+    const spy = vi.spyOn(staging, 'stageFile');
+    spy.mockRejectedValueOnce(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }));
+
+    const { ing, outbox, sock } = setup({ stageRetries: 3 });
+    const outcome = await ing.ingest(sock as never, msg());
+
+    expect(outcome).toBe('queued');
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(outbox.has('g@g.us:A1')).toBe(true);
+    spy.mockRestore();
+  });
+
+  it('reports a capture failure once every retry is exhausted', async () => {
+    const staging = await import('../src/sync/staging.ts');
+    const spy = vi
+      .spyOn(staging, 'stageFile')
+      .mockRejectedValue(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }));
+
+    const onCaptureFailed = vi.fn();
+    const { ing, outbox, sock } = setup({ onCaptureFailed, stageRetries: 1 });
+    const outcome = await ing.ingest(sock as never, msg());
+
+    expect(outcome).toBe('error');
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(outbox.has('g@g.us:A1')).toBe(false);
+    expect(onCaptureFailed).toHaveBeenCalledTimes(1);
+    expect(onCaptureFailed.mock.calls[0][0]).toMatchObject({
+      messageId: 'g@g.us:A1',
+      groupJid: 'g@g.us',
+    });
+    expect(onCaptureFailed.mock.calls[0][0].error).toContain('ENOSPC');
+    spy.mockRestore();
+  });
+
+  it('does not retry an enqueue failure, and reports it', async () => {
+    const onCaptureFailed = vi.fn();
+    const { ing, sock } = setup({
+      onCaptureFailed,
+      outboxOverride: {
+        has: () => false,
+        enqueue: () => {
+          throw new Error('NOT NULL constraint failed: outbox.captured_at');
+        },
+      },
+    });
+    expect(await ing.ingest(sock as never, msg())).toBe('error');
+    expect(onCaptureFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let a throwing onCaptureFailed escape ingest', async () => {
+    const staging = await import('../src/sync/staging.ts');
+    const spy = vi.spyOn(staging, 'stageFile').mockRejectedValue(new Error('ENOSPC'));
+    const { ing, sock } = setup({
+      stageRetries: 0,
+      onCaptureFailed: () => {
+        throw new Error('alerter exploded');
+      },
+    });
+    await expect(ing.ingest(sock as never, msg())).resolves.toBe('error');
+    spy.mockRestore();
   });
 });
