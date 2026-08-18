@@ -1,7 +1,10 @@
-import type { WAMessage } from '@whiskeysockets/baileys';
+import type { WAMessage, WASocket } from '@whiskeysockets/baileys';
 import {
+  getAlertSettings,
   getDedupDb,
   getDrainSettings,
+  getHealthFile,
+  getHealthMonitorSettings,
   getOutboxDir,
   getWaAuthDir,
   loadConfig,
@@ -21,6 +24,10 @@ import { handleBackfillMessage } from './sync/backfillIngest.ts';
 import { resolveWhitelist } from './wa/groupResolver.ts';
 import { startWaClient } from './wa/client.ts';
 import { createGate } from './util/gate.ts';
+import { AlertStore } from './alert/alertStore.ts';
+import { createAlerter } from './alert/alerter.ts';
+import { startHealthMonitor } from './health/monitor.ts';
+import { describeGap, detectGaps, lastCapturedByGroup } from './sync/gapDetect.ts';
 
 /** WhatsApp message timestamp (seconds), tolerant of number | Long | undefined. */
 function tsSecOf(m: WAMessage): number {
@@ -72,12 +79,53 @@ async function main(): Promise<void> {
   // that DedupStore's constructor creates.
   const dedup = new DedupStore(db);
   const outbox = new OutboxStore(db);
+  const alertStore = new AlertStore(db);
 
   // A crash between staging a file and inserting its row leaves an orphan.
   const swept = await sweepOrphans(outboxDir, outbox.allFilePaths());
   if (swept > 0) logger.info({ swept }, 'outbox: removed orphaned staged files');
 
-  const ingest = createIngest({ config, dedup, outbox, outboxDir, logger, extractDeps: { logger } });
+  // The socket is replaced on every reconnect, so the alerter reads it through
+  // a getter rather than capturing one instance.
+  let currentSock: WASocket | null = null;
+  // Last WhatsApp activity, in-memory. The monitor copies it into the
+  // heartbeat file once per tick; stamping the file per message would mean an
+  // fsync-adjacent write on every photo for no extra signal.
+  let lastWaActivityAt: number | null = null;
+  const noteWaActivity = (): void => {
+    lastWaActivityAt = Date.now();
+  };
+
+  const alertSettings = getAlertSettings();
+  const alerter = createAlerter({
+    store: alertStore,
+    getSock: () => currentSock,
+    targetJid: alertSettings.targetJid,
+    cooldownMs: alertSettings.cooldownMs,
+    logger,
+  });
+
+  const ingest = createIngest({
+    config,
+    dedup,
+    outbox,
+    outboxDir,
+    logger,
+    extractDeps: { logger },
+    onCaptureFailed: ({ messageId, groupJid, error }) => {
+      // Fire-and-forget: ingest is on the message hot path and must not wait
+      // on a WhatsApp round-trip. raise() never throws, but .catch anyway —
+      // an unhandled rejection here would kill the process under
+      // `restart: always`.
+      void alerter
+        .raise(
+          'capture-failed',
+          `wa-immich-sync: could not capture media from ${groupJid} (${messageId}). ` +
+            `This one is NOT queued and will not retry. Error: ${error}`,
+        )
+        .catch((err) => logger.warn({ err: (err as Error).message }, 'capture-failed alert threw'));
+    },
+  });
   const drainSettings = getDrainSettings();
   const drain = startDrain({ immich, outbox, logger, ...drainSettings });
   logger.info({ ...drainSettings, outboxDir, pending: outbox.depth() }, 'drain started');
@@ -91,6 +139,31 @@ async function main(): Promise<void> {
   // in docker-compose.yml, a crash loop that also drops the WhatsApp socket.
   void drain.tick().catch((err) => {
     logger.error({ err: (err as Error).message }, 'drain: initial tick failed');
+  });
+
+  const healthMonitorSettings = getHealthMonitorSettings();
+  const healthFile = getHealthFile();
+  const healthMonitor = startHealthMonitor({
+    outbox,
+    alerter,
+    heartbeatPath: healthFile,
+    waActivity: () => lastWaActivityAt,
+    thresholds: {
+      outboxDepth: alertSettings.outboxDepth,
+      outboxAgeMs: alertSettings.outboxAgeMs,
+    },
+    intervalMs: healthMonitorSettings.intervalMs,
+    logger,
+  });
+  logger.info(
+    { ...healthMonitorSettings, healthFile, outboxDepth: alertSettings.outboxDepth, outboxAgeMs: alertSettings.outboxAgeMs },
+    'health monitor started',
+  );
+  // Stamp the heartbeat immediately: the Dockerfile's start-period covers the
+  // boot window, but a first tick a full interval later leaves the file absent
+  // (and therefore "unhealthy") for no reason.
+  void healthMonitor.tick().catch((err) => {
+    logger.warn({ err: (err as Error).message }, 'health: initial tick failed');
   });
 
   // Backfill cursor: oldest seen message per whitelisted group, fed by both
@@ -121,6 +194,7 @@ async function main(): Promise<void> {
     syncFullHistory: config.backfill,
     logger,
     onMessage: async (sock, m) => {
+      noteWaActivity();
       await whitelistGate.wait();
       const jid = m.key?.remoteJid ?? '';
       const hasDocument = JSON.stringify(m.message ?? {}).includes('documentMessage');
@@ -178,6 +252,8 @@ async function main(): Promise<void> {
         }
       : undefined,
     onReady: async (sock) => {
+      currentSock = sock;
+      noteWaActivity();
       logger.info('ready — resolving groups');
 
       try {
@@ -211,6 +287,31 @@ async function main(): Promise<void> {
       // against the previous (or empty) whitelist, same as before this gate.
       whitelistGate.open();
 
+      // Gap detection. Reports only — Phase 3 adds the catch-up traversal that
+      // recovers the window. Runs after the whitelist is resolved so
+      // whitelistJids is populated, and before the early return below, so it
+      // still runs with BACKFILL=false.
+      try {
+        const gaps = detectGaps({
+          lastKnown: lastCapturedByGroup(db),
+          groupJids: [...whitelistJids],
+          now: Date.now(),
+          thresholdMs: alertSettings.gapThresholdMs,
+        });
+        for (const gap of gaps) {
+          logger.warn({ ...gap }, 'gap detected');
+          // Keyed per group so one quiet group cannot cool down the alert for
+          // every other group.
+          await alerter.raise(
+            `gap:${gap.groupJid}`,
+            `wa-immich-sync: ${describeGap(gap)}. If the daemon was down, that window ` +
+              'is not recovered automatically — re-import a chat export to fill it.',
+          );
+        }
+      } catch (err) {
+        logger.warn({ err: (err as Error).message }, 'gap detection failed');
+      }
+
       if (!config.backfill) return;
 
       // Seed the backfill cursor from the dedup DB. WhatsApp's on-connect
@@ -232,6 +333,17 @@ async function main(): Promise<void> {
       backfill?.stop();
       backfill = startBackfill({ sock, groupJids: [...whitelistJids], anchors, logger });
       logger.info({ groups: whitelistJids.size }, 'backfill: pump started');
+    },
+    onReconnectScheduled: ({ attempt, delayMs, statusCode }) => {
+      if (attempt < alertSettings.reconnectFailures) return;
+      void alerter
+        .raise(
+          'reconnect-failures',
+          `wa-immich-sync: WhatsApp has failed to reconnect ${attempt} times in a row ` +
+            `(status ${statusCode ?? 'unknown'}, next try in ${Math.round(delayMs / 1000)}s). ` +
+            'Media sent during this window may not be recoverable.',
+        )
+        .catch((err) => logger.warn({ err: (err as Error).message }, 'reconnect alert threw'));
     },
   });
 
@@ -257,6 +369,7 @@ async function main(): Promise<void> {
       return;
     }
     logger.info('shutting down');
+    healthMonitor.stop();
 
     // Bounded, not unbounded: race drain.stop() against a timeout so a slow
     // batch can't hang shutdown forever. `.unref()` the timer so it can never
