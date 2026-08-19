@@ -19,6 +19,7 @@
     "list-groups": "tsx scripts/list-groups.ts",
     "import": "tsx scripts/import-export.ts",
     "status": "tsx scripts/status.ts",
+    "healthcheck": "tsx scripts/healthcheck.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

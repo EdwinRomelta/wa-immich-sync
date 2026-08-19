@@ -25,3 +25,4 @@ agentdb.rvf
 .mcp.json
 claude-flow.config*.json*
 CLAUDE.md
+.superpowers/

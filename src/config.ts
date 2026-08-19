@@ -96,20 +96,65 @@ export function getOutboxDir(): string {
   return process.env.OUTBOX_DIR ?? './data/outbox';
 }
 
+/** Path to the liveness file the Docker healthcheck reads (see src/health/heartbeat.ts). */
+export function getHealthFile(): string {
+  ensureDotenv();
+  return process.env.HEALTH_FILE ?? './data/health.json';
+}
+
+/** Healthcheck tuning. Default per the Phase 2 design spec. */
+export function getHealthSettings(): { staleMs: number } {
+  ensureDotenv();
+  return { staleMs: intEnv('HEALTH_STALE_MS', 3_600_000) };
+}
+
+/** Alerting thresholds and cooldown. Defaults per the Phase 2 design spec. */
+export function getAlertSettings(): {
+  cooldownMs: number;
+  /** ALERT_TARGET_JID; undefined means "the bot's own number". */
+  targetJid?: string;
+  outboxDepth: number;
+  outboxAgeMs: number;
+  reconnectFailures: number;
+  /** Per-group silence before a gap is reported. */
+  gapThresholdMs: number;
+} {
+  ensureDotenv();
+  return {
+    cooldownMs: intEnv('ALERT_COOLDOWN_MS', 21_600_000),
+    targetJid: process.env.ALERT_TARGET_JID?.trim() || undefined,
+    outboxDepth: intEnv('ALERT_OUTBOX_DEPTH', 50),
+    outboxAgeMs: intEnv('ALERT_OUTBOX_AGE_MS', 7_200_000),
+    reconnectFailures: intEnv('ALERT_RECONNECT_FAILURES', 10),
+    gapThresholdMs: intEnv('CATCHUP_GAP_THRESHOLD_MS', 3_600_000),
+  };
+}
+
+/**
+ * How often the health monitor stamps the heartbeat and checks the outbox.
+ * Must be comfortably below HEALTH_STALE_MS, or a healthy daemon looks stale
+ * between ticks.
+ */
+export function getHealthMonitorSettings(): { intervalMs: number } {
+  ensureDotenv();
+  return { intervalMs: intEnv('HEALTH_INTERVAL_MS', 60_000) };
+}
+
 /**
  * Paths `ensureOutboxDirWritable`'s overlap guard must never let OUTBOX_DIR
- * reach: the dedup db file and the WhatsApp auth dir. Every caller of
- * `ensureOutboxDirWritable` MUST pass this list — a caller that omits it (as
- * `scripts/import-export.ts` once did) makes the overlap check a silent
- * no-op, letting OUTBOX_DIR=./data plant the outbox marker next to
- * synced.db/auth/ and stage media the daemon's own guard then refuses to
- * boot on, leaving it undrained. Defined once here, rather than inlined at
- * each call site, so the two sites cannot drift apart again.
+ * reach: the dedup db file, the WhatsApp auth dir, and the health file. Every
+ * caller of `ensureOutboxDirWritable` MUST pass this list — a caller that
+ * omits it (as `scripts/import-export.ts` once did) makes the overlap check a
+ * silent no-op, letting OUTBOX_DIR=./data plant the outbox marker next to
+ * synced.db/auth/ and health.json, and stage media the daemon's own guard
+ * then refuses to boot on, leaving it undrained. Defined once here, rather
+ * than inlined at each call site, so the call sites cannot drift apart again.
  */
 export function outboxGuards(): OverlapGuard[] {
   return [
     { label: 'DEDUP_DB', path: getDedupDb() },
     { label: 'WA_AUTH_DIR', path: getWaAuthDir() },
+    { label: 'HEALTH_FILE', path: getHealthFile() },
   ];
 }
 

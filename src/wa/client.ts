@@ -51,6 +51,23 @@ export interface WaClientOptions {
    * Set internally when re-entering after a disconnect; callers pass nothing.
    */
   reconnectAttempt?: number;
+  /**
+   * Called each time a reconnect is scheduled, with the 1-based consecutive
+   * attempt number. A link that keeps bouncing is the one WhatsApp-side fault
+   * the WhatsApp alert channel can still report — a link that is fully down
+   * cannot send anything, which is what the Docker healthcheck covers instead.
+   */
+  onReconnectScheduled?: (info: { attempt: number; delayMs: number; statusCode?: number }) => void;
+  /**
+   * Called on every inbound WebSocket frame — keepalives included, which
+   * Baileys exchanges roughly every 30s on a healthy link. This is a
+   * link-liveness signal, distinct from onMessage/onReady: those fire only
+   * on actual chat traffic or a fresh connection, so a quiet whitelisted
+   * chat makes them go stale even while the link itself is fine. The stall
+   * watchdog above still forces a reconnect after 10 minutes of total frame
+   * silence, so a genuinely dead link lets this go stale too.
+   */
+  onFrame?: () => void;
 }
 
 /**
@@ -87,7 +104,21 @@ export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
       sock.end(new Error('stall watchdog'));
     },
   });
-  sock.ws.on('message', () => watchdog.touch());
+  sock.ws.on('message', () => {
+    watchdog.touch();
+    try {
+      opts.onFrame?.();
+    } catch (err) {
+      // Synchronous handler on the raw WebSocket, outside Baileys' own
+      // event emitter — a throw here would escape uncaught. Same shape as
+      // onReconnectScheduled's guard below: an alerting/stamping failure
+      // must not turn into a dead link.
+      opts.logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'onFrame threw',
+      );
+    }
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, qr, lastDisconnect } = update;
@@ -133,6 +164,17 @@ export async function startWaClient(opts: WaClientOptions): Promise<WASocket> {
         jitterRatio: RECONNECT_JITTER,
       });
       opts.logger.info({ attempt: nextAttempt, delayMs }, 'scheduling WhatsApp reconnect');
+      try {
+        opts.onReconnectScheduled?.({ attempt: nextAttempt, delayMs, statusCode });
+      } catch (err) {
+        // This handler is synchronous and inside Baileys' event emitter; a
+        // throw here would escape into the emitter and skip the reconnect
+        // scheduled below, turning an alerting failure into a dead link.
+        opts.logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'onReconnectScheduled threw',
+        );
+      }
       setTimeout(() => {
         startWaClient({ ...opts, reconnectAttempt: nextAttempt }).catch((err) =>
           opts.logger.error(err, 'reconnect failed'),

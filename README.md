@@ -47,6 +47,37 @@ an immediate first pass on boot so a backlog doesn't sit idle), retries failed u
 exponential backoff, and only removes a row (and its staged file) once Immich confirms the upload.
 A startup sweep clears any staged file left behind by a crash between staging and the row insert.
 
+### Knowing when it stops
+
+Durability answers "can a photo be lost while the daemon runs". It says nothing
+about the daemon not running — an outage on 2026-07-29 went unnoticed for six
+days. Three signals cover that:
+
+- **Docker healthcheck.** The daemon rewrites `HEALTH_FILE` every
+  `HEALTH_INTERVAL_MS` with two stamps: `daemon` (proves the event loop is
+  alive) and `wa` (proves the WhatsApp link is alive, driven by inbound
+  WebSocket frames — keepalives included, roughly every 30s — not just chat
+  messages, so a whitelisted group being quiet overnight does not by itself
+  make the container unhealthy). The container is marked `unhealthy` once
+  *either* stamp is older than `HEALTH_STALE_MS`. Check it with `docker ps` or
+  run it by hand with `npm run healthcheck`. It reports liveness only — **an
+  unreachable Immich is deliberately not unhealthy**, because media still
+  queues durably to disk.
+- **WhatsApp alerts.** The bot messages `ALERT_TARGET_JID` (its own number by
+  default) when the outbox passes `ALERT_OUTBOX_DEPTH` or `ALERT_OUTBOX_AGE_MS`,
+  when a whitelisted group has been silent longer than
+  `CATCHUP_GAP_THRESHOLD_MS`, when WhatsApp has failed to reconnect
+  `ALERT_RECONNECT_FAILURES` times in a row, or when a message could not be
+  captured to disk at all. Each condition is rate-limited to one message per
+  `ALERT_COOLDOWN_MS`, and that cooldown is persisted, so a restart loop cannot
+  turn into a notification storm.
+- **`npm run status`.** Adds a Health section, last-media-per-group send times,
+  and which alerts have fired.
+
+A detected gap is **reported, not recovered** — WhatsApp does not reliably
+re-deliver a window a linked device missed. Fill it by re-importing a chat
+export into the backfill group.
+
 ## Prerequisites
 
 - Node.js **≥ 22** (uses built-in `fetch`/`FormData` and `process.loadEnvFile`)
@@ -115,6 +146,15 @@ All configuration is via environment variables (see `.env.example`):
 | `DRAIN_MAX_BACKOFF_MS` | | `3600000` | Backoff ceiling; raised to `DRAIN_BASE_BACKOFF_MS` if set lower |
 | `DRAIN_DROP_AFTER_ATTEMPTS` | | `3` | Retries a row earns before an unusable staged file is treated as terminal and dropped |
 | `DRAIN_MAX_DROPS_PER_TICK` | | `5` | Cap on terminal drops per tick, so a directory outage can't empty the queue |
+| `HEALTH_FILE` | | `./data/health.json` | Liveness file the Docker healthcheck reads. Subject to the same overlap guard as `DEDUP_DB` and `WA_AUTH_DIR`: it must not sit inside `OUTBOX_DIR` |
+| `HEALTH_INTERVAL_MS` | | `60000` | How often the daemon stamps the heartbeat and checks the outbox backlog |
+| `HEALTH_STALE_MS` | | `3600000` | Heartbeat age at which the container is reported `unhealthy` |
+| `ALERT_TARGET_JID` | | own number | Where WhatsApp alerts are sent |
+| `ALERT_COOLDOWN_MS` | | `21600000` | Minimum gap between repeats of one alert condition |
+| `ALERT_OUTBOX_DEPTH` | | `50` | Queued items before alerting that Immich is not accepting uploads |
+| `ALERT_OUTBOX_AGE_MS` | | `7200000` | Age of the oldest queued item before alerting |
+| `ALERT_RECONNECT_FAILURES` | | `10` | Consecutive WhatsApp reconnect failures before alerting |
+| `CATCHUP_GAP_THRESHOLD_MS` | | `3600000` | Per-group silence before a gap is reported |
 
 **Whitelist by name or JID.** Each `WHITELIST_GROUPS` entry is matched by group name, or treated
 as an exact JID if it contains `@g.us`. If a name matches **multiple** groups, all of them are
@@ -178,7 +218,8 @@ stack, see the commented `networks:` block in `docker-compose.yml`.
 | `npm run list-groups` | Print the groups you are in (names + JIDs) |
 | `npm run dev` / `npm start` | Run the sync daemon |
 | `npm run import -- <folder>` | Import an exported-chat folder |
-| `npm run status` | Show how many assets have been synced, plus outbox depth/age/errors for anything still queued |
+| `npm run status` | Synced counts, outbox depth/age/errors, daemon health, last media per group, and which alerts have fired |
+| `npm run healthcheck` | Run the Docker healthcheck by hand; exits non-zero when the heartbeat is stale |
 | `npm test` / `npm run typecheck` | Tests (all I/O mocked) / type check |
 
 ## Caveats

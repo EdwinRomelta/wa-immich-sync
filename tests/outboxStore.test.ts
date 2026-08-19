@@ -207,4 +207,25 @@ describe('OutboxStore', () => {
       expect(snap.oldestPendingAgeMs).toBeGreaterThanOrEqual(0);
     });
   });
+
+  it('carries captured_at from the outbox row into synced', () => {
+    const db = openDb(':memory:');
+    new DedupStore(db);
+    const outbox = new OutboxStore(db);
+    outbox.enqueue({
+      messageId: 'g@g.us:A1',
+      groupJid: 'g@g.us',
+      albumName: 'Daycare',
+      filePath: '/tmp/g_g.us_A1',
+      fileName: 'IMG-A1.jpg',
+      mimeType: 'image/jpeg',
+      capturedAt: 1_700_000_000_000,
+      createdAt: 1_700_000_500_000,
+    });
+    const [row] = outbox.due(Date.now(), 10);
+    outbox.markSyncedAndRemove(row, 'asset-1', 'created');
+
+    const synced = db.prepare('SELECT captured_at FROM synced WHERE message_id = ?').get('g@g.us:A1');
+    expect(synced).toEqual({ captured_at: 1_700_000_000_000 });
+  });
 });

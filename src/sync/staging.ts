@@ -18,10 +18,10 @@ export interface OverlapGuard {
    * The thing to guard — pass the actual path that must never be reachable
    * by a directory sweep. For a single file (e.g. the dedup db), pass the
    * file's own path, not its parent directory: the shipped defaults put
-   * OUTBOX_DIR, DEDUP_DB, and WA_AUTH_DIR as siblings under the same `./data`
-   * parent, so guarding on that shared parent directory would flag the
-   * default configuration itself as an overlap. For a directory (e.g. the WA
-   * auth dir), pass the directory itself.
+   * OUTBOX_DIR, DEDUP_DB, WA_AUTH_DIR, and HEALTH_FILE as siblings under the
+   * same `./data` parent, so guarding on that shared parent directory would
+   * flag the default configuration itself as an overlap. For a directory
+   * (e.g. the WA auth dir), pass the directory itself.
    */
   path: string;
 }
@@ -135,7 +135,7 @@ const KNOWN_ENTRIES = new Set([OUTBOX_MARKER_FILE, 'tmp', '.write-probe']);
  * is no safe way to proceed without a writable place to put bytes.
  *
  * `guards` should name every path that must never be reachable by the
- * startup sweep (the dedup db file, the WhatsApp auth dir) — see
+ * startup sweep (the dedup db file, the WhatsApp auth dir, the health file) — see
  * `assertNoOverlap`. Callers pass these in rather than this module reading
  * them from config, so staging.ts stays free of env access and unit
  * testable. `guards` is required (not defaulted to `[]`) so a call site can
@@ -193,8 +193,8 @@ export async function ensureOutboxDirWritable(dir: string, guards: OverlapGuard[
  *
  * A non-empty directory with no `OUTBOX_MARKER_FILE` is refused outright,
  * rather than swept. The overlap check in `ensureOutboxDirWritable` guards
- * the specific paths known at startup (the dedup db file, the WA auth dir),
- * but it can't guard against every possible future repoint of OUTBOX_DIR onto
+ * the specific paths known at startup (the dedup db file, the WA auth dir,
+ * the health file), but it can't guard against every possible future repoint of OUTBOX_DIR onto
  * arbitrary user data. The marker is the second, independent line of defense: it only
  * appears in a directory this code itself prepared, so a directory that's
  * merely non-empty (an unrelated folder, a mistake, a home directory) is
